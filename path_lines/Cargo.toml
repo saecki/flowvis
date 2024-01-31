@@ -1,0 +1,13 @@
+[package]
+name = "path_lines"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+winit = "0.28"
+env_logger = "0.10"
+log = "0.4"
+wgpu = "0.18"
+# async runtime
+pollster = "0.3.0"
