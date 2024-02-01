@@ -35,7 +35,7 @@ fn main() {
 async fn run() -> anyhow::Result<()> {
     env_logger::init();
 
-    let flow_field = flow::Field::read("../flow.raw".as_ref())?;
+    let flow_field = flow::Field::read("flow.raw".as_ref())?;
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new().build(&event_loop).unwrap();

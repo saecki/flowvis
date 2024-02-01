@@ -1,5 +1,5 @@
 [package]
-name = "path_lines"
+name = "flowvis"
 version = "0.1.0"
 edition = "2021"
 
