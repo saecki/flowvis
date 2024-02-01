@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -21,6 +22,12 @@ const T_END: f32 = 23.0;
 const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
 const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
 const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
+
+const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
+    width: X_CELLS as u32,
+    height: Y_CELLS as u32,
+    depth_or_array_layers: 1,
+};
 
 struct FlowField {
     max_velocity: f32,
@@ -80,6 +87,10 @@ struct State {
 
     bg_pipeline: BgPipeline,
 
+    play: bool,
+    last_frame_uploaded: Instant,
+    current_frame: usize,
+    uploaded_frame: usize,
     flow_field: FlowField,
 }
 
@@ -87,6 +98,7 @@ struct BgPipeline {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     num_vertices: u32,
+    velocity_texture: wgpu::Texture,
     velocity_bind_group: wgpu::BindGroup,
 }
 
@@ -152,6 +164,23 @@ impl TextureVertex {
     }
 }
 
+fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: &[Vec2]) {
+    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<_>>();
+
+    let pixel_size = std::mem::size_of::<f32>() as u32;
+    let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
+    queue.write_texture(
+        texture.as_image_copy(),
+        bytemuck::cast_slice(&velocities),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(VELOCITY_TEXTURE_SIZE.height),
+        },
+        VELOCITY_TEXTURE_SIZE,
+    );
+}
+
 impl State {
     async fn new(window: Window, flow_field: FlowField) -> Self {
         let size = window.inner_size();
@@ -206,22 +235,9 @@ impl State {
         surface.configure(&device, &config);
 
         let bg_pipeline = {
-            // TODO: figure out how to cycle dynamically through frames
-            let velocities = flow_field
-                .frame(0)
-                .iter()
-                .map(|v| v.norm())
-                .collect::<Vec<_>>();
-
-            let (width, height) = (X_CELLS as u32, Y_CELLS as u32);
-            let texture_size = wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            };
             let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("velocity_texture"),
-                size: texture_size,
+                size: VELOCITY_TEXTURE_SIZE,
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -229,19 +245,7 @@ impl State {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-
-            let pixel_size = std::mem::size_of::<f32>() as u32;
-            let bytes_per_row = pixel_size * width;
-            queue.write_texture(
-                velocity_texture.as_image_copy(),
-                bytemuck::cast_slice(&velocities),
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(height),
-                },
-                texture_size,
-            );
+            write_frame_to_texture(&queue, &velocity_texture, flow_field.frame(0));
 
             let velocity_texture_view =
                 velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -384,6 +388,7 @@ impl State {
                 render_pipeline,
                 vertex_buffer,
                 num_vertices,
+                velocity_texture,
                 velocity_bind_group,
             }
         };
@@ -396,6 +401,10 @@ impl State {
             config,
             size,
 
+            play: true,
+            last_frame_uploaded: Instant::now(),
+            current_frame: 0,
+            uploaded_frame: 0,
             bg_pipeline,
 
             flow_field,
@@ -416,12 +425,48 @@ impl State {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::KeyboardInput {
+                input:
+                    KeyboardInput {
+                        virtual_keycode: Some(keycode),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => match keycode {
+                VirtualKeyCode::Space => {
+                    self.play = !self.play;
+                }
+                VirtualKeyCode::Comma => {
+                    self.current_frame = self.current_frame.checked_sub(1).unwrap_or(T_CELLS - 1);
+                }
+                VirtualKeyCode::Period => {
+                    self.current_frame = (self.current_frame + 1) % T_CELLS;
+                }
+                _ => (),
+            },
+            _ => (),
+        }
         false
     }
 
     fn update(&mut self) {
-        // TODO: upload next frame
-        // self.bg_pipeline.velocity_bind_group.
+        let now = Instant::now();
+        let desired_delta = Duration::from_secs_f32(T_STEP);
+        let actual_delta = now.duration_since(self.last_frame_uploaded);
+        if self.play && actual_delta >= desired_delta {
+            self.current_frame = (self.current_frame + 1) % T_CELLS;
+        }
+        if self.current_frame != self.uploaded_frame {
+            write_frame_to_texture(
+                &self.queue,
+                &self.bg_pipeline.velocity_texture,
+                self.flow_field.frame(self.current_frame),
+            );
+            self.last_frame_uploaded = now;
+            self.uploaded_frame = self.current_frame;
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
