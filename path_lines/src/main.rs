@@ -87,6 +87,7 @@ struct State {
 
     bg_pipeline: BgPipeline,
 
+    filter: bool,
     play: bool,
     last_frame_uploaded: Instant,
     current_frame: usize,
@@ -164,6 +165,173 @@ impl TextureVertex {
     }
 }
 
+fn create_bg_pipeline(
+    flow_field: &FlowField,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+    filter: bool,
+) -> BgPipeline {
+    let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("velocity_texture"),
+        size: VELOCITY_TEXTURE_SIZE,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(0));
+
+    let velocity_texture_view =
+        velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: match filter {
+            true => wgpu::FilterMode::Linear,
+            false => wgpu::FilterMode::Nearest,
+        },
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("max_velocity_buffer"),
+        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: filter },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // should match filterable field above
+                    ty: wgpu::BindingType::Sampler(match filter {
+                        true => wgpu::SamplerBindingType::Filtering,
+                        false => wgpu::SamplerBindingType::NonFiltering,
+                    }),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // should match filterable field above
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("max_velocity"),
+        });
+
+    let velocity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        layout: &texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&velocity_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&velocity_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: max_velocity_buffer.as_entire_binding(),
+            },
+        ],
+        label: Some("velocity_bind_group"),
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("texture_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("texture_shader.wgsl"))),
+    });
+    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bg_render_pipline_layout"),
+        bind_group_layouts: &[&texture_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("bg_render_pipeline"),
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[TextureVertex::desc()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            // Requires Features::DEPTH_CLIP_CONTROL
+            unclipped_depth: false,
+            // Requires Features::CONSERVATIVE_RASTERIZATION
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    });
+
+    #[rustfmt::skip]
+    const BG_QUAD: &[TextureVertex] = &[
+        TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
+        TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
+    ];
+    let num_vertices = BG_QUAD.len() as u32;
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bg_vertex_buffer"),
+        contents: bytemuck::cast_slice(BG_QUAD),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    BgPipeline {
+        render_pipeline,
+        vertex_buffer,
+        num_vertices,
+        velocity_texture,
+        velocity_bind_group,
+    }
+}
+
 fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: &[Vec2]) {
     let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<_>>();
 
@@ -234,164 +402,8 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let bg_pipeline = {
-            let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("velocity_texture"),
-                size: VELOCITY_TEXTURE_SIZE,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            write_frame_to_texture(&queue, &velocity_texture, flow_field.frame(0));
-
-            let velocity_texture_view =
-                velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-                address_mode_u: wgpu::AddressMode::ClampToEdge,
-                address_mode_v: wgpu::AddressMode::ClampToEdge,
-                address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::FilterMode::Nearest,
-                ..Default::default()
-            });
-
-            let max_velocity_buffer =
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("max_velocity_buffer"),
-                    contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                });
-
-            let texture_bind_group_layout =
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            // should match filterable field above
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            // should match filterable field above
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                    label: Some("max_velocity"),
-                });
-
-            let velocity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&velocity_texture_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&velocity_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: max_velocity_buffer.as_entire_binding(),
-                    },
-                ],
-                label: Some("velocity_bind_group"),
-            });
-
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("texture_shader"),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
-                    "texture_shader.wgsl"
-                ))),
-            });
-            let render_pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("bg_render_pipline_layout"),
-                    bind_group_layouts: &[&texture_bind_group_layout],
-                    push_constant_ranges: &[],
-                });
-
-            let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("bg_render_pipeline"),
-                layout: Some(&render_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_main",
-                    buffers: &[TextureVertex::desc()],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_main",
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleStrip,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    // Requires Features::DEPTH_CLIP_CONTROL
-                    unclipped_depth: false,
-                    // Requires Features::CONSERVATIVE_RASTERIZATION
-                    conservative: false,
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview: None,
-            });
-
-            #[rustfmt::skip]
-            const BG_VERTICES: &[TextureVertex] = &[
-                TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
-                TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
-                TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
-                TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
-            ];
-            let num_vertices = BG_VERTICES.len() as u32;
-            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bg_vertex_buffer"),
-                contents: bytemuck::cast_slice(BG_VERTICES),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-
-            BgPipeline {
-                render_pipeline,
-                vertex_buffer,
-                num_vertices,
-                velocity_texture,
-                velocity_bind_group,
-            }
-        };
+        let filter = true;
+        let bg_pipeline = create_bg_pipeline(&flow_field, &device, &queue, &config, filter);
 
         Self {
             window,
@@ -401,6 +413,7 @@ impl State {
             config,
             size,
 
+            filter,
             play: true,
             last_frame_uploaded: Instant::now(),
             current_frame: 0,
@@ -443,6 +456,16 @@ impl State {
                 }
                 VirtualKeyCode::Period => {
                     self.current_frame = (self.current_frame + 1) % T_CELLS;
+                }
+                VirtualKeyCode::F => {
+                    self.filter = !self.filter;
+                    self.bg_pipeline = create_bg_pipeline(
+                        &self.flow_field,
+                        &self.device,
+                        &self.queue,
+                        &self.config,
+                        self.filter,
+                    );
                 }
                 _ => (),
             },
