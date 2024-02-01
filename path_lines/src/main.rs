@@ -182,10 +182,12 @@ impl TextureVertex {
 }
 
 fn create_bg_pipeline(
-    flow_field: &FlowField,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
+    flow_field: &FlowField,
+    current_frame: usize,
+    current_color_map: usize,
     filter: bool,
 ) -> BgPipeline {
     let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -198,7 +200,7 @@ fn create_bg_pipeline(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(0));
+    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
     let velocity_texture_view =
         velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -230,7 +232,7 @@ fn create_bg_pipeline(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_color_map_to_texture(queue, &color_map_texture, &color_map::INFERNO);
+    write_color_map_to_texture(queue, &color_map_texture, COLOR_MAPS[current_color_map]);
     let color_map_texture_view =
         color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -503,8 +505,18 @@ impl State {
         };
         surface.configure(&device, &config);
 
+        let current_frame = 0;
+        let current_color_map = 0;
         let filter = true;
-        let bg_pipeline = create_bg_pipeline(&flow_field, &device, &queue, &config, filter);
+        let bg_pipeline = create_bg_pipeline(
+            &device,
+            &queue,
+            &config,
+            &flow_field,
+            current_frame,
+            current_color_map,
+            filter,
+        );
 
         Self {
             window,
@@ -517,10 +529,10 @@ impl State {
             filter,
             play: true,
             last_frame_uploaded: Instant::now(),
-            current_frame: 0,
-            uploaded_frame: 0,
-            current_color_map: 0,
-            uploaded_color_map: 0,
+            current_frame,
+            uploaded_frame: current_frame,
+            current_color_map,
+            uploaded_color_map: current_color_map,
             bg_pipeline,
 
             flow_field,
@@ -566,10 +578,12 @@ impl State {
                 KeyCode::KeyF => {
                     self.filter = !self.filter;
                     self.bg_pipeline = create_bg_pipeline(
-                        &self.flow_field,
                         &self.device,
                         &self.queue,
                         &self.config,
+                        &self.flow_field,
+                        self.current_frame,
+                        self.current_color_map,
                         self.filter,
                     );
                 }
