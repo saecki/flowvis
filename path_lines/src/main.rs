@@ -98,7 +98,8 @@ struct State {
 struct BgPipeline {
     render_pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
-    num_vertices: u32,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
     velocity_texture: wgpu::Texture,
     velocity_bind_group: wgpu::BindGroup,
 }
@@ -290,7 +291,7 @@ fn create_bg_pipeline(
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
@@ -310,23 +311,34 @@ fn create_bg_pipeline(
     });
 
     #[rustfmt::skip]
-    const BG_QUAD: &[TextureVertex] = &[
+    const BG_VERTICES: &[TextureVertex] = &[
         TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
         TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
         TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
     ];
-    let num_vertices = BG_QUAD.len() as u32;
+    #[rustfmt::skip]
+    const BG_INDICES: &[u16] = &[
+        0, 1, 3,
+        1, 2, 3,
+    ];
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("bg_vertex_buffer"),
-        contents: bytemuck::cast_slice(BG_QUAD),
+        contents: bytemuck::cast_slice(BG_VERTICES),
         usage: wgpu::BufferUsages::VERTEX,
     });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bg_index_buffer"),
+        contents: bytemuck::cast_slice(BG_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let num_indices = BG_INDICES.len() as u32;
 
     BgPipeline {
         render_pipeline,
         vertex_buffer,
-        num_vertices,
+        index_buffer,
+        num_indices,
         velocity_texture,
         velocity_bind_group,
     }
@@ -524,7 +536,8 @@ impl State {
                 render_pass.set_pipeline(&bg.render_pipeline);
                 render_pass.set_bind_group(0, &bg.velocity_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bg.vertex_buffer.slice(..));
-                render_pass.draw(0..bg.num_vertices, 0..1);
+                render_pass.set_index_buffer(bg.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..bg.num_indices, 0, 0..1);
             }
         }
 
