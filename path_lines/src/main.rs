@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+use winit::event_loop::EventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowBuilder};
 
 const X_CELLS: usize = 400;
@@ -79,7 +80,7 @@ impl Vec2 {
 
 struct State {
     window: Window,
-    surface: wgpu::Surface,
+    surface: wgpu::Surface<'static>, // is this ok ???
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -345,9 +346,10 @@ fn create_bg_pipeline(
 }
 
 fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: &[Vec2]) {
-    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<_>>();
+    type PixelType = f32;
+    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
 
-    let pixel_size = std::mem::size_of::<f32>() as u32;
+    let pixel_size = std::mem::size_of::<PixelType>() as u32;
     let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
     queue.write_texture(
         texture.as_image_copy(),
@@ -372,7 +374,10 @@ impl State {
 
         // SAFETY: the surface needs to live as long as the window that created it.
         // The State struct owns the window, so this should be safe
-        let surface = unsafe { instance.create_surface(&window) }.unwrap();
+        let surface = unsafe {
+            let target = wgpu::SurfaceTargetUnsafe::from_window(&window).unwrap();
+            instance.create_surface_unsafe(target).unwrap()
+        };
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -386,8 +391,8 @@ impl State {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
-                    limits: wgpu::Limits::default(),
+                    required_features: wgpu::Features::FLOAT32_FILTERABLE,
+                    required_limits: wgpu::Limits::default(),
                     label: None,
                 },
                 None,
@@ -402,7 +407,10 @@ impl State {
             .copied()
             .filter(|f| f.is_srgb())
             .next()
-            .unwrap_or(surface_caps.formats[0]);
+            .unwrap_or_else(|| {
+                dbg!("oh no, anyway...");
+                surface_caps.formats[0]
+            });
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -411,6 +419,7 @@ impl State {
             present_mode: surface_caps.present_modes[0],
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: Vec::new(),
+            desired_maximum_frame_latency: 1,
         };
         surface.configure(&device, &config);
 
@@ -452,24 +461,24 @@ impl State {
     fn input(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::KeyboardInput {
-                input:
-                    KeyboardInput {
-                        virtual_keycode: Some(keycode),
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(keycode),
                         state: ElementState::Pressed,
                         ..
                     },
                 ..
             } => match keycode {
-                VirtualKeyCode::Space => {
+                KeyCode::Space => {
                     self.play = !self.play;
                 }
-                VirtualKeyCode::Comma => {
+                KeyCode::Comma => {
                     self.current_frame = self.current_frame.checked_sub(1).unwrap_or(T_CELLS - 1);
                 }
-                VirtualKeyCode::Period => {
+                KeyCode::Period => {
                     self.current_frame = (self.current_frame + 1) % T_CELLS;
                 }
-                VirtualKeyCode::F => {
+                KeyCode::KeyF => {
                     self.filter = !self.filter;
                     self.bg_pipeline = create_bg_pipeline(
                         &self.flow_field,
@@ -559,59 +568,63 @@ async fn run() -> anyhow::Result<()> {
 
     let flow_field = FlowField::read("../flow.raw".as_ref())?;
 
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-    let scale = 4;
-    window.set_inner_size(PhysicalSize::new(
-        scale * X_CELLS as u32,
-        scale * Y_CELLS as u32,
-    ));
+    const SCALE: u32 = 4;
+    const CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
+        width: SCALE * X_CELLS as u32,
+        height: SCALE * Y_CELLS as u32,
+    };
+    window.set_min_inner_size(Some(CONTENT_SIZE));
+    window.set_max_inner_size(Some(CONTENT_SIZE));
 
     let mut state = State::new(window, flow_field).await;
 
-    event_loop.run(move |event, _, control_flow| match event {
+    event_loop.run(move |event, window_target| match event {
         Event::WindowEvent { window_id, event } if window_id == state.window().id() => {
             if !state.input(&event) {
                 match event {
+                    WindowEvent::RedrawRequested => {
+                        state.update();
+                        match state.render() {
+                            Ok(_) => {}
+                            // Reconfigure if the surface is lost
+                            Err(wgpu::SurfaceError::Lost) => {
+                                state.resize(state.size);
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => {
+                                window_target.exit();
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
                     WindowEvent::CloseRequested
                     | WindowEvent::KeyboardInput {
-                        input:
-                            KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
                                 state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
                                 ..
                             },
                         ..
                     } => {
-                        *control_flow = ControlFlow::Exit;
+                        window_target.exit();
                     }
                     WindowEvent::Resized(physical_size) => {
                         state.resize(physical_size);
                     }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                        state.resize(*new_inner_size);
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        // TODO: does this need handling
                     }
                     _ => {}
                 }
             }
         }
-        Event::RedrawRequested(window_id) => {
-            if window_id == state.window().id() {
-                state.update();
-                match state.render() {
-                    Ok(_) => {}
-                    // Reconfigure if the surface is lost
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                    Err(wgpu::SurfaceError::OutOfMemory) => {
-                        *control_flow = ControlFlow::ExitWithCode(1);
-                    }
-                    Err(e) => eprintln!("{e}"),
-                }
-            }
-        }
-        Event::MainEventsCleared => {
+        Event::AboutToWait => {
             state.window().request_redraw();
         }
         _ => {}
-    });
+    })?;
+
+    Ok(())
 }
