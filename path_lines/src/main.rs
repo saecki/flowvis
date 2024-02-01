@@ -28,7 +28,7 @@ const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
 const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
 const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
 
-const COLOR_MAPS: [&ColorMap; 2] = [&color_map::INFERNO, &color_map::GRAY];
+const COLOR_MAPS: [&ColorMap; 3] = [&color_map::GRAY, &color_map::INFERNO, &color_map::VIRIDIS];
 
 const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
     width: X_CELLS as u32,
