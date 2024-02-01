@@ -4,6 +4,7 @@ use std::path::Path;
 
 use image::GenericImageView;
 use wgpu::util::{DeviceExt, RenderEncoder};
+use wgpu::Features;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -174,7 +175,7 @@ impl State {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
-                    features: wgpu::Features::empty(),
+                    features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
                     limits: wgpu::Limits::default(),
                     label: None,
                 },
@@ -205,7 +206,7 @@ impl State {
         let bg_pipeline = {
             // TODO: figure out how to cycle dynamically through frames
             let velocities = flow_field
-                .frame(899)
+                .frame(0)
                 .iter()
                 .map(|v| v.norm())
                 .collect::<Vec<_>>();
@@ -246,7 +247,7 @@ impl State {
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
                 address_mode_v: wgpu::AddressMode::ClampToEdge,
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: wgpu::FilterMode::Nearest,
+                mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Nearest,
                 mipmap_filter: wgpu::FilterMode::Nearest,
                 ..Default::default()
@@ -268,7 +269,7 @@ impl State {
                             binding: 0,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
                                 view_dimension: wgpu::TextureViewDimension::D2,
                                 multisampled: false,
                             },
@@ -278,7 +279,7 @@ impl State {
                             binding: 1,
                             visibility: wgpu::ShaderStages::FRAGMENT,
                             // should match filterable field above
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                             count: None,
                         },
                         wgpu::BindGroupLayoutEntry {
