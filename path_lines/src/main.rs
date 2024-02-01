@@ -1,10 +1,7 @@
 use std::borrow::Cow;
-use std::num::NonZeroU64;
 use std::path::Path;
 
-use image::GenericImageView;
-use wgpu::util::{DeviceExt, RenderEncoder};
-use wgpu::Features;
+use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
@@ -26,25 +23,27 @@ const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
 const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
 
 struct FlowField {
+    max_velocity: f32,
     data: Vec<Vec2>,
 }
 
 impl FlowField {
     #[cfg(target_endian = "little")]
     fn read(path: &Path) -> anyhow::Result<FlowField> {
-        const ELEM_SIZE: usize = std::mem::size_of::<Vec2>();
-        let mut raw = std::fs::read(path)?;
-        let num_elems = raw.len() / ELEM_SIZE;
-        if num_elems != TOTAL_ELEMS {
-            anyhow::bail!("Expected ");
-        }
+        use std::io::Read;
 
-        raw.truncate(num_elems * ELEM_SIZE);
+        let mut file = std::fs::File::open(path)?;
+        let mut data = vec![Vec2::ZERO; TOTAL_ELEMS];
+        let raw = bytemuck::cast_slice_mut(data.as_mut_slice());
+        file.read_exact(raw)?;
 
-        // SAFETY: the target machine is little endian and the containers length is a multiple of the
-        // struct size
-        let data = unsafe { std::mem::transmute(raw) };
-        Ok(FlowField { data })
+        let max_velocity = data
+            .iter()
+            .copied()
+            .map(|v| v.norm())
+            .max_by(f32::total_cmp)
+            .unwrap();
+        Ok(FlowField { max_velocity, data })
     }
 
     fn get(&self, t: usize, (x, y): (usize, usize)) -> Vec2 {
@@ -56,13 +55,16 @@ impl FlowField {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
 struct Vec2 {
     x: f32,
     y: f32,
 }
 
 impl Vec2 {
+    const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
+
     fn norm(&self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
     }
@@ -253,12 +255,10 @@ impl State {
                 ..Default::default()
             });
 
-            let max_velocity = velocities.iter().copied().max_by(f32::total_cmp).unwrap();
-            dbg!(max_velocity);
             let max_velocity_buffer =
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("max_velocity_buffer"),
-                    contents: bytemuck::cast_slice(&[max_velocity]),
+                    contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
                     usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 });
 
@@ -420,7 +420,8 @@ impl State {
     }
 
     fn update(&mut self) {
-        // TODO
+        // TODO: upload next frame
+        // self.bg_pipeline.velocity_bind_group.
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
