@@ -9,6 +9,10 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowBuilder};
 
+use crate::color_map::ColorMap;
+
+mod color_map;
+
 const X_CELLS: usize = 400;
 const X_START: f32 = -0.5;
 const X_END: f32 = 7.5;
@@ -24,9 +28,16 @@ const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
 const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
 const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
 
+const COLOR_MAPS: [&ColorMap; 2] = [&color_map::INFERNO, &color_map::GRAY];
+
 const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
     width: X_CELLS as u32,
     height: Y_CELLS as u32,
+    depth_or_array_layers: 1,
+};
+const COLOR_MAP_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
+    width: color_map::SIZE as u32,
+    height: 1,
     depth_or_array_layers: 1,
 };
 
@@ -93,6 +104,8 @@ struct State {
     last_frame_uploaded: Instant,
     current_frame: usize,
     uploaded_frame: usize,
+    current_color_map: usize,
+    uploaded_color_map: usize,
     flow_field: FlowField,
 }
 
@@ -102,7 +115,8 @@ struct BgPipeline {
     index_buffer: wgpu::Buffer,
     num_indices: u32,
     velocity_texture: wgpu::Texture,
-    velocity_bind_group: wgpu::BindGroup,
+    color_map_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
@@ -185,7 +199,6 @@ fn create_bg_pipeline(
         view_formats: &[],
     });
     write_frame_to_texture(queue, &velocity_texture, flow_field.frame(0));
-
     let velocity_texture_view =
         velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -207,8 +220,35 @@ fn create_bg_pipeline(
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
+    let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color_map_texture"),
+        size: COLOR_MAP_TEXTURE_SIZE,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D1,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_color_map_to_texture(queue, &color_map_texture, &color_map::INFERNO);
+    let color_map_texture_view =
+        color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: match filter {
+            true => wgpu::FilterMode::Linear,
+            false => wgpu::FilterMode::Nearest,
+        },
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
     let texture_bind_group_layout =
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_1"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -223,7 +263,7 @@ fn create_bg_pipeline(
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field above
+                    // should match filterable field of the texture
                     ty: wgpu::BindingType::Sampler(match filter {
                         true => wgpu::SamplerBindingType::Filtering,
                         false => wgpu::SamplerBindingType::NonFiltering,
@@ -233,7 +273,6 @@ fn create_bg_pipeline(
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field above
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -241,11 +280,27 @@ fn create_bg_pipeline(
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D1,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // should match filterable field of the texture
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
-            label: Some("max_velocity"),
         });
 
-    let velocity_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         layout: &texture_bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
@@ -259,6 +314,14 @@ fn create_bg_pipeline(
             wgpu::BindGroupEntry {
                 binding: 2,
                 resource: max_velocity_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&color_map_sampler),
             },
         ],
         label: Some("velocity_bind_group"),
@@ -341,7 +404,8 @@ fn create_bg_pipeline(
         index_buffer,
         num_indices,
         velocity_texture,
-        velocity_bind_group,
+        color_map_texture,
+        bind_group,
     }
 }
 
@@ -360,6 +424,22 @@ fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: &
             rows_per_image: Some(VELOCITY_TEXTURE_SIZE.height),
         },
         VELOCITY_TEXTURE_SIZE,
+    );
+}
+
+fn write_color_map_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, map: &ColorMap) {
+    type PixelType = [u8; 4];
+    let pixel_size = std::mem::size_of::<PixelType>() as u32;
+    let bytes_per_row = pixel_size * color_map::SIZE as u32;
+    queue.write_texture(
+        texture.as_image_copy(),
+        bytemuck::cast_slice(map.as_slice()),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: None,
+        },
+        COLOR_MAP_TEXTURE_SIZE,
     );
 }
 
@@ -439,6 +519,8 @@ impl State {
             last_frame_uploaded: Instant::now(),
             current_frame: 0,
             uploaded_frame: 0,
+            current_color_map: 0,
+            uploaded_color_map: 0,
             bg_pipeline,
 
             flow_field,
@@ -478,6 +560,9 @@ impl State {
                 KeyCode::Period => {
                     self.current_frame = (self.current_frame + 1) % T_CELLS;
                 }
+                KeyCode::KeyC => {
+                    self.current_color_map = (self.current_color_map + 1) % COLOR_MAPS.len();
+                }
                 KeyCode::KeyF => {
                     self.filter = !self.filter;
                     self.bg_pipeline = create_bg_pipeline(
@@ -511,6 +596,14 @@ impl State {
             self.last_frame_uploaded = now;
             self.uploaded_frame = self.current_frame;
         }
+        if self.current_color_map != self.uploaded_color_map {
+            write_color_map_to_texture(
+                &self.queue,
+                &self.bg_pipeline.color_map_texture,
+                COLOR_MAPS[self.current_color_map],
+            );
+            self.uploaded_color_map = self.current_color_map;
+        }
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -543,7 +636,7 @@ impl State {
             {
                 let bg = &self.bg_pipeline;
                 render_pass.set_pipeline(&bg.render_pipeline);
-                render_pass.set_bind_group(0, &bg.velocity_bind_group, &[]);
+                render_pass.set_bind_group(0, &bg.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bg.vertex_buffer.slice(..));
                 render_pass.set_index_buffer(bg.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..bg.num_indices, 0, 0..1);
