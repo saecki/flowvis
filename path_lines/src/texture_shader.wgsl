@@ -37,6 +37,5 @@ var color_map_sampler: sampler;
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let velocity = textureSample(velocity_texture, velocity_sampler, in.tex_coords).r;
     let normalized = velocity / max_velocity;
-    let color = textureSample(color_map_texture, color_map_sampler, normalized);
-    return color;
+    return textureSample(color_map_texture, color_map_sampler, normalized);
 }

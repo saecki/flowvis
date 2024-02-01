@@ -4,7 +4,7 @@ pub const SIZE: usize = 256;
 pub struct ColorMap([[u8; 4]; SIZE]);
 
 impl ColorMap {
-    pub fn as_slice(&self) -> &[[u8; 4]] {
+    pub const fn as_slice(&self) -> &[[u8; 4]] {
         &self.0
     }
 }

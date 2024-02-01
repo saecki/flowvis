@@ -1,10 +1,9 @@
 use std::borrow::Cow;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
+use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowBuilder};
@@ -12,27 +11,13 @@ use winit::window::{Window, WindowBuilder};
 use crate::color_map::ColorMap;
 
 mod color_map;
-
-const X_CELLS: usize = 400;
-const X_START: f32 = -0.5;
-const X_END: f32 = 7.5;
-const X_STEP: f32 = (X_END - X_START) / X_CELLS as f32;
-const Y_CELLS: usize = 50;
-const Y_START: f32 = -0.5;
-const Y_END: f32 = 0.5;
-const Y_STEP: f32 = (Y_END - Y_START) / Y_CELLS as f32;
-const T_CELLS: usize = 1001;
-const T_START: f32 = 15.0;
-const T_END: f32 = 23.0;
-const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
-const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
-const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
+mod flow;
 
 const COLOR_MAPS: [&ColorMap; 3] = [&color_map::GRAY, &color_map::INFERNO, &color_map::VIRIDIS];
 
 const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
-    width: X_CELLS as u32,
-    height: Y_CELLS as u32,
+    width: flow::X_CELLS as u32,
+    height: flow::Y_CELLS as u32,
     depth_or_array_layers: 1,
 };
 const COLOR_MAP_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
@@ -41,52 +26,76 @@ const COLOR_MAP_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
     depth_or_array_layers: 1,
 };
 
-struct FlowField {
-    max_velocity: f32,
-    data: Vec<Vec2>,
-}
-
-impl FlowField {
-    #[cfg(target_endian = "little")]
-    fn read(path: &Path) -> anyhow::Result<FlowField> {
-        use std::io::Read;
-
-        let mut file = std::fs::File::open(path)?;
-        let mut data = vec![Vec2::ZERO; TOTAL_ELEMS];
-        let raw = bytemuck::cast_slice_mut(data.as_mut_slice());
-        file.read_exact(raw)?;
-
-        let max_velocity = data
-            .iter()
-            .copied()
-            .map(|v| v.norm())
-            .max_by(f32::total_cmp)
-            .unwrap();
-        Ok(FlowField { max_velocity, data })
-    }
-
-    fn get(&self, t: usize, (x, y): (usize, usize)) -> Vec2 {
-        self.data[t * Y_CELLS * X_CELLS + y * X_CELLS + x]
-    }
-
-    fn frame(&self, t: usize) -> &[Vec2] {
-        &self.data[t * FRAME_SIZE..(t + 1) * FRAME_SIZE]
+fn main() {
+    if let Err(e) = pollster::block_on(run()) {
+        eprintln!("{e}");
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-#[repr(C)]
-struct Vec2 {
-    x: f32,
-    y: f32,
-}
+async fn run() -> anyhow::Result<()> {
+    env_logger::init();
 
-impl Vec2 {
-    const ZERO: Vec2 = Vec2 { x: 0.0, y: 0.0 };
+    let flow_field = flow::Field::read("../flow.raw".as_ref())?;
 
-    fn norm(&self) -> f32 {
-        (self.x * self.x + self.y * self.y).sqrt()
-    }
+    let event_loop = EventLoop::new()?;
+    let window = WindowBuilder::new().build(&event_loop).unwrap();
+    const SCALE: u32 = 4;
+    const CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
+        width: SCALE * flow::X_CELLS as u32,
+        height: SCALE * flow::Y_CELLS as u32,
+    };
+    window.set_min_inner_size(Some(CONTENT_SIZE));
+    window.set_max_inner_size(Some(CONTENT_SIZE));
+
+    let mut state = State::new(window, flow_field).await;
+
+    event_loop.run(move |event, window_target| match event {
+        Event::WindowEvent { window_id, event } if window_id == state.window().id() => {
+            if !state.input(&event) {
+                match event {
+                    WindowEvent::RedrawRequested => {
+                        state.update();
+                        match state.render() {
+                            Ok(_) => {}
+                            // Reconfigure if the surface is lost
+                            Err(wgpu::SurfaceError::Lost) => {
+                                state.resize(state.size);
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => {
+                                window_target.exit();
+                            }
+                            Err(e) => eprintln!("{e}"),
+                        }
+                    }
+                    WindowEvent::CloseRequested
+                    | WindowEvent::KeyboardInput {
+                        event:
+                            KeyEvent {
+                                physical_key: PhysicalKey::Code(KeyCode::Escape),
+                                state: ElementState::Pressed,
+                                ..
+                            },
+                        ..
+                    } => {
+                        window_target.exit();
+                    }
+                    WindowEvent::Resized(physical_size) => {
+                        state.resize(physical_size);
+                    }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        // TODO: does this need handling
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Event::AboutToWait => {
+            state.window().request_redraw();
+        }
+        _ => {}
+    })?;
+
+    Ok(())
 }
 
 struct State {
@@ -98,6 +107,7 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
 
     bg_pipeline: BgPipeline,
+    path_line_pipeline: FieldLinePipeline,
 
     filter: bool,
     play: bool,
@@ -106,347 +116,14 @@ struct State {
     uploaded_frame: usize,
     current_color_map: usize,
     uploaded_color_map: usize,
-    flow_field: FlowField,
-}
-
-struct BgPipeline {
-    render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
-    num_indices: u32,
-    velocity_texture: wgpu::Texture,
-    color_map_texture: wgpu::Texture,
-    bind_group: wgpu::BindGroup,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct ColorVertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
-
-impl ColorVertex {
-    /// [
-    ///     wgpu::VertexAttribute {
-    ///         offset: 0,
-    ///         shader_location: 0,
-    ///         format: wgpu::VertexFormat::Float32x3,
-    ///     },
-    ///     wgpu::VertexAttribute {
-    ///         offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-    ///         shader_location: 1,
-    ///         format: wgpu::VertexFormat::Float32x3,
-    ///     },
-    /// ],
-    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
-        0 => Float32x3,
-        1 => Float32x3,
-    ];
-
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<ColorVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &Self::ATTRIBUTES,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct TextureVertex {
-    position: [f32; 3],
-    tex_coords: [f32; 2],
-}
-
-impl TextureVertex {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: std::mem::size_of::<TextureVertex>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-            ],
-        }
-    }
-}
-
-fn create_bg_pipeline(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    config: &wgpu::SurfaceConfiguration,
-    flow_field: &FlowField,
-    current_frame: usize,
-    current_color_map: usize,
-    filter: bool,
-) -> BgPipeline {
-    let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("velocity_texture"),
-        size: VELOCITY_TEXTURE_SIZE,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
-    let velocity_texture_view =
-        velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: match filter {
-            true => wgpu::FilterMode::Linear,
-            false => wgpu::FilterMode::Nearest,
-        },
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
-
-    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("max_velocity_buffer"),
-        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
-
-    let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("color_map_texture"),
-        size: COLOR_MAP_TEXTURE_SIZE,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D1,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    write_color_map_to_texture(queue, &color_map_texture, COLOR_MAPS[current_color_map]);
-    let color_map_texture_view =
-        color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
-    let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        address_mode_u: wgpu::AddressMode::ClampToEdge,
-        address_mode_v: wgpu::AddressMode::ClampToEdge,
-        address_mode_w: wgpu::AddressMode::ClampToEdge,
-        mag_filter: match filter {
-            true => wgpu::FilterMode::Linear,
-            false => wgpu::FilterMode::Nearest,
-        },
-        min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
-        ..Default::default()
-    });
-
-    let texture_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind_group_1"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: filter },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field of the texture
-                    ty: wgpu::BindingType::Sampler(match filter {
-                        true => wgpu::SamplerBindingType::Filtering,
-                        false => wgpu::SamplerBindingType::NonFiltering,
-                    }),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D1,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field of the texture
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        layout: &texture_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&velocity_texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&velocity_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: max_velocity_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::Sampler(&color_map_sampler),
-            },
-        ],
-        label: Some("velocity_bind_group"),
-    });
-
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("texture_shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("texture_shader.wgsl"))),
-    });
-    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("bg_render_pipline_layout"),
-        bind_group_layouts: &[&texture_bind_group_layout],
-        push_constant_ranges: &[],
-    });
-
-    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("bg_render_pipeline"),
-        layout: Some(&render_pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: &[TextureVertex::desc()],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[Some(wgpu::ColorTargetState {
-                format: config.format,
-                blend: Some(wgpu::BlendState::REPLACE),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // Requires Features::DEPTH_CLIP_CONTROL
-            unclipped_depth: false,
-            // Requires Features::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        multiview: None,
-    });
-
-    #[rustfmt::skip]
-    const BG_VERTICES: &[TextureVertex] = &[
-        TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
-        TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
-        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
-    ];
-    #[rustfmt::skip]
-    const BG_INDICES: &[u16] = &[
-        0, 1, 3,
-        1, 2, 3,
-    ];
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bg_vertex_buffer"),
-        contents: bytemuck::cast_slice(BG_VERTICES),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bg_index_buffer"),
-        contents: bytemuck::cast_slice(BG_INDICES),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    let num_indices = BG_INDICES.len() as u32;
-
-    BgPipeline {
-        render_pipeline,
-        vertex_buffer,
-        index_buffer,
-        num_indices,
-        velocity_texture,
-        color_map_texture,
-        bind_group,
-    }
-}
-
-fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: &[Vec2]) {
-    type PixelType = f32;
-    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
-
-    let pixel_size = std::mem::size_of::<PixelType>() as u32;
-    let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
-    queue.write_texture(
-        texture.as_image_copy(),
-        bytemuck::cast_slice(&velocities),
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: Some(VELOCITY_TEXTURE_SIZE.height),
-        },
-        VELOCITY_TEXTURE_SIZE,
-    );
-}
-
-fn write_color_map_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, map: &ColorMap) {
-    type PixelType = [u8; 4];
-    let pixel_size = std::mem::size_of::<PixelType>() as u32;
-    let bytes_per_row = pixel_size * color_map::SIZE as u32;
-    queue.write_texture(
-        texture.as_image_copy(),
-        bytemuck::cast_slice(map.as_slice()),
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(bytes_per_row),
-            rows_per_image: None,
-        },
-        COLOR_MAP_TEXTURE_SIZE,
-    );
+    mouse_pos: flow::Pos2,
+    line_origins: Vec<flow::Pos2>,
+    lines_invalidated: bool,
+    flow_field: flow::Field,
 }
 
 impl State {
-    async fn new(window: Window, flow_field: FlowField) -> Self {
+    async fn new(window: Window, flow_field: flow::Field) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -518,6 +195,8 @@ impl State {
             filter,
         );
 
+        let path_line_pipeline = create_line_pipeline(&device, &queue, &config);
+
         Self {
             window,
             surface,
@@ -526,6 +205,9 @@ impl State {
             config,
             size,
 
+            bg_pipeline,
+            path_line_pipeline,
+
             filter,
             play: true,
             last_frame_uploaded: Instant::now(),
@@ -533,8 +215,9 @@ impl State {
             uploaded_frame: current_frame,
             current_color_map,
             uploaded_color_map: current_color_map,
-            bg_pipeline,
-
+            mouse_pos: flow::Pos2 { x: 30.0, y: 25.0 },
+            line_origins: Vec::new(),
+            lines_invalidated: true,
             flow_field,
         }
     }
@@ -565,15 +248,19 @@ impl State {
             } => match keycode {
                 KeyCode::Space => {
                     self.play = !self.play;
+                    true
                 }
                 KeyCode::Comma => {
-                    self.current_frame = self.current_frame.checked_sub(1).unwrap_or(T_CELLS - 1);
+                    self.prev_frame();
+                    true
                 }
                 KeyCode::Period => {
-                    self.current_frame = (self.current_frame + 1) % T_CELLS;
+                    self.next_frame();
+                    true
                 }
                 KeyCode::KeyC => {
                     self.current_color_map = (self.current_color_map + 1) % COLOR_MAPS.len();
+                    true
                 }
                 KeyCode::KeyF => {
                     self.filter = !self.filter;
@@ -586,20 +273,54 @@ impl State {
                         self.current_color_map,
                         self.filter,
                     );
+                    true
                 }
-                _ => (),
+                _ => false,
             },
-            _ => (),
+            WindowEvent::CursorMoved { position, .. } => {
+                let flow_pos = flow::Pos2 {
+                    x: (flow::X_CELLS - 1) as f32
+                        * (position.x as f32 / (self.size.width - 1) as f32),
+                    // flip y pos
+                    y: (flow::Y_CELLS - 1) as f32
+                        * (1.0 - position.y as f32 / (self.size.height - 1) as f32),
+                };
+
+                self.mouse_pos = flow_pos;
+                self.lines_invalidated = true;
+                true
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button,
+                ..
+            } => match button {
+                MouseButton::Left => {
+                    self.line_origins.push(self.mouse_pos);
+                    self.lines_invalidated = true;
+                    true
+                }
+                MouseButton::Right => {
+                    self.line_origins
+                        .retain(|&o| (o - self.mouse_pos).norm() >= 1.0);
+                    self.lines_invalidated = true;
+                    true
+                }
+                MouseButton::Middle
+                | MouseButton::Back
+                | MouseButton::Forward
+                | MouseButton::Other(_) => false,
+            },
+            _ => false,
         }
-        false
     }
 
     fn update(&mut self) {
         let now = Instant::now();
-        let desired_delta = Duration::from_secs_f32(T_STEP);
+        let desired_delta = Duration::from_secs_f32(flow::T_STEP);
         let actual_delta = now.duration_since(self.last_frame_uploaded);
         if self.play && actual_delta >= desired_delta {
-            self.current_frame = (self.current_frame + 1) % T_CELLS;
+            self.next_frame();
         }
         if self.current_frame != self.uploaded_frame {
             write_frame_to_texture(
@@ -618,6 +339,54 @@ impl State {
             );
             self.uploaded_color_map = self.current_color_map;
         }
+        if self.lines_invalidated {
+            let pl = &mut self.path_line_pipeline;
+            pl.vertices.clear();
+            pl.indices.clear();
+            for p in self.line_origins.iter() {
+                compute_stream_line(
+                    &mut pl.vertices,
+                    &mut pl.indices,
+                    &self.flow_field,
+                    self.current_frame,
+                    *p,
+                );
+            }
+            compute_stream_line(
+                &mut pl.vertices,
+                &mut pl.indices,
+                &self.flow_field,
+                self.current_frame,
+                self.mouse_pos,
+            );
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.vertex_buffer,
+                &pl.vertices,
+                wgpu::BufferUsages::VERTEX,
+            );
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.index_buffer,
+                &pl.indices,
+                wgpu::BufferUsages::INDEX,
+            );
+        }
+    }
+
+    fn prev_frame(&mut self) {
+        self.current_frame = self
+            .current_frame
+            .checked_sub(1)
+            .unwrap_or(flow::T_CELLS - 1);
+        self.lines_invalidated = true;
+    }
+
+    fn next_frame(&mut self) {
+        self.current_frame = (self.current_frame + 1) % flow::T_CELLS;
+        self.lines_invalidated = true;
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -655,6 +424,15 @@ impl State {
                 render_pass.set_index_buffer(bg.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
                 render_pass.draw_indexed(0..bg.num_indices, 0, 0..1);
             }
+
+            {
+                let pl = &self.path_line_pipeline;
+                render_pass.set_pipeline(&pl.render_pipeline);
+                render_pass.set_bind_group(0, &pl.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..2 * pl.indices.len() as u32, 0, 0..1);
+            }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -664,74 +442,571 @@ impl State {
     }
 }
 
-fn main() {
-    if let Err(e) = pollster::block_on(run()) {
-        eprintln!("{e}");
+struct BgPipeline {
+    render_pipeline: wgpu::RenderPipeline,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    num_indices: u32,
+    velocity_texture: wgpu::Texture,
+    color_map_texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+}
+
+struct FieldLinePipeline {
+    render_pipeline: wgpu::RenderPipeline,
+    vertices: Vec<ColorVertex>,
+    indices: Vec<[u16; 2]>,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ColorVertex {
+    position: [f32; 3],
+    color: f32,
+}
+
+impl ColorVertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ColorVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32,
+                },
+            ],
+        }
     }
 }
 
-async fn run() -> anyhow::Result<()> {
-    env_logger::init();
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct TextureVertex {
+    position: [f32; 3],
+    tex_coords: [f32; 2],
+}
 
-    let flow_field = FlowField::read("../flow.raw".as_ref())?;
-
-    let event_loop = EventLoop::new()?;
-    let window = WindowBuilder::new().build(&event_loop).unwrap();
-    const SCALE: u32 = 4;
-    const CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
-        width: SCALE * X_CELLS as u32,
-        height: SCALE * Y_CELLS as u32,
-    };
-    window.set_min_inner_size(Some(CONTENT_SIZE));
-    window.set_max_inner_size(Some(CONTENT_SIZE));
-
-    let mut state = State::new(window, flow_field).await;
-
-    event_loop.run(move |event, window_target| match event {
-        Event::WindowEvent { window_id, event } if window_id == state.window().id() => {
-            if !state.input(&event) {
-                match event {
-                    WindowEvent::RedrawRequested => {
-                        state.update();
-                        match state.render() {
-                            Ok(_) => {}
-                            // Reconfigure if the surface is lost
-                            Err(wgpu::SurfaceError::Lost) => {
-                                state.resize(state.size);
-                            }
-                            Err(wgpu::SurfaceError::OutOfMemory) => {
-                                window_target.exit();
-                            }
-                            Err(e) => eprintln!("{e}"),
-                        }
-                    }
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                state: ElementState::Pressed,
-                                ..
-                            },
-                        ..
-                    } => {
-                        window_target.exit();
-                    }
-                    WindowEvent::Resized(physical_size) => {
-                        state.resize(physical_size);
-                    }
-                    WindowEvent::ScaleFactorChanged { .. } => {
-                        // TODO: does this need handling
-                    }
-                    _ => {}
-                }
-            }
+impl TextureVertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TextureVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
         }
-        Event::AboutToWait => {
-            state.window().request_redraw();
-        }
-        _ => {}
-    })?;
+    }
+}
 
-    Ok(())
+fn create_bg_pipeline(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+    flow_field: &flow::Field,
+    current_frame: usize,
+    current_color_map: usize,
+    filter: bool,
+) -> BgPipeline {
+    let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("velocity_texture"),
+        size: VELOCITY_TEXTURE_SIZE,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
+    let velocity_texture_view =
+        velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: match filter {
+            true => wgpu::FilterMode::Linear,
+            false => wgpu::FilterMode::Nearest,
+        },
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("max_velocity_buffer"),
+        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color_map_texture_1"),
+        size: COLOR_MAP_TEXTURE_SIZE,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D1,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    write_color_map_to_texture(queue, &color_map_texture, COLOR_MAPS[current_color_map]);
+    let color_map_texture_view =
+        color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let texture_bind_group_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout_1"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: filter },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // should match filterable field of the texture
+                    ty: wgpu::BindingType::Sampler(match filter {
+                        true => wgpu::SamplerBindingType::Filtering,
+                        false => wgpu::SamplerBindingType::NonFiltering,
+                    }),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D1,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    // should match filterable field of the texture
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind_group_1"),
+        layout: &texture_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&velocity_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&velocity_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: max_velocity_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&color_map_sampler),
+            },
+        ],
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("texture_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("texture_shader.wgsl"))),
+    });
+    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("render_pipline_layout_1"),
+        bind_group_layouts: &[&texture_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("render_pipeline_1"),
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[TextureVertex::desc()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            // Requires Features::DEPTH_CLIP_CONTROL
+            unclipped_depth: false,
+            // Requires Features::CONSERVATIVE_RASTERIZATION
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    });
+
+    #[rustfmt::skip]
+    const BG_VERTICES: &[TextureVertex] = &[
+        TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
+        TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
+    ];
+    #[rustfmt::skip]
+    const BG_INDICES: &[u16] = &[
+        0, 1, 3,
+        1, 2, 3,
+    ];
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bg_vertex_buffer"),
+        contents: bytemuck::cast_slice(BG_VERTICES),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bg_index_buffer"),
+        contents: bytemuck::cast_slice(BG_INDICES),
+        usage: wgpu::BufferUsages::INDEX,
+    });
+    let num_indices = BG_INDICES.len() as u32;
+
+    BgPipeline {
+        render_pipeline,
+        vertex_buffer,
+        index_buffer,
+        num_indices,
+        velocity_texture,
+        color_map_texture,
+        bind_group,
+    }
+}
+
+fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: flow::Frame) {
+    type PixelType = f32;
+    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
+
+    let pixel_size = std::mem::size_of::<PixelType>() as u32;
+    let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
+    queue.write_texture(
+        texture.as_image_copy(),
+        bytemuck::cast_slice(&velocities),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(VELOCITY_TEXTURE_SIZE.height),
+        },
+        VELOCITY_TEXTURE_SIZE,
+    );
+}
+
+fn write_color_map_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, map: &ColorMap) {
+    type PixelType = [u8; 4];
+    let pixel_size = std::mem::size_of::<PixelType>() as u32;
+    let bytes_per_row = pixel_size * color_map::SIZE as u32;
+    queue.write_texture(
+        texture.as_image_copy(),
+        bytemuck::cast_slice(map.as_slice()),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: None,
+        },
+        COLOR_MAP_TEXTURE_SIZE,
+    );
+}
+
+fn create_line_pipeline(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+) -> FieldLinePipeline {
+    let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("color_map_texture_1"),
+        size: COLOR_MAP_TEXTURE_SIZE,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D1,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    write_color_map_to_texture(queue, &color_map_texture, &color_map::INFERNO);
+    let color_map_texture_view =
+        color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bind_group_layout_2"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D1,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                // should match filterable field of the texture
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind_group_2"),
+        layout: &bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&color_map_sampler),
+            },
+        ],
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("line_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("line_shader.wgsl"))),
+    });
+    let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("render_pipline_layout_2"),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("render_pipeline_2"),
+        layout: Some(&render_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[ColorVertex::desc()],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: config.format,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back),
+            polygon_mode: wgpu::PolygonMode::Fill,
+            // Requires Features::DEPTH_CLIP_CONTROL
+            unclipped_depth: false,
+            // Requires Features::CONSERVATIVE_RASTERIZATION
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    });
+
+    #[rustfmt::skip]
+    let vertices = Vec::new();
+    let indices = Vec::new();
+
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("line_vertex_buffer"),
+        contents: bytemuck::cast_slice(&vertices),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+    });
+    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("line_index_buffer"),
+        contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+    });
+
+    FieldLinePipeline {
+        render_pipeline,
+        vertices,
+        indices,
+        vertex_buffer,
+        index_buffer,
+        bind_group,
+    }
+}
+
+/// Either reuse the buffer if there is enough space, or destroy it and create a new one.
+fn update_buffer<T: bytemuck::NoUninit>(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    values: &[T],
+    usage: wgpu::BufferUsages,
+) {
+    let raw = bytemuck::cast_slice(values);
+    if buffer.size() < raw.len() as u64 {
+        buffer.destroy();
+        *buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("line_index_buffer"),
+            contents: raw,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+        });
+    } else {
+        queue.write_buffer(buffer, 0, raw);
+    }
+}
+
+fn compute_stream_line(
+    vertices: &mut Vec<ColorVertex>,
+    indices: &mut Vec<[u16; 2]>,
+    flow_field: &flow::Field,
+    current_frame: usize,
+    start_pos: flow::Pos2,
+) {
+    fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 3] {
+        [
+            2.0 * (pos.x / (flow::X_CELLS - 1) as f32) - 1.0,
+            2.0 * (pos.y / (flow::Y_CELLS - 1) as f32) - 1.0,
+            0.0,
+        ]
+    }
+
+    let frame = flow_field.frame(current_frame);
+    let first_index = vertices.len();
+    let mut empty = true;
+    let mut pos = start_pos;
+    let step_size = 0.5;
+    loop {
+        let velocity = bilinear_lookup(&frame, pos);
+        if velocity.norm() < f32::EPSILON {
+            break;
+        }
+
+        pos += velocity * step_size;
+        if pos.x < 0.0
+            || pos.y < 0.0
+            || pos.x > (flow::X_CELLS - 1) as f32
+            || pos.y > (flow::Y_CELLS - 1) as f32
+        {
+            break;
+        }
+
+        let color = velocity.norm() / flow_field.max_velocity;
+        if empty {
+            vertices.push(ColorVertex {
+                position: flow_pos_to_wgpu_coord(start_pos),
+                color,
+            });
+            empty = false;
+        }
+        vertices.push(ColorVertex {
+            position: flow_pos_to_wgpu_coord(pos),
+            color,
+        });
+    }
+
+    if first_index < vertices.len() {
+        indices.extend((first_index..vertices.len() - 1).map(|i| [i as u16, i as u16 + 1]));
+    }
+}
+
+fn bilinear_lookup(frame: &flow::Frame, pos: flow::Pos2) -> flow::Vec2 {
+    let aa = frame.get(pos.x.floor() as usize, pos.y.floor() as usize);
+    let ab = frame.get(pos.x.floor() as usize, pos.y.ceil() as usize);
+    let ba = frame.get(pos.x.ceil() as usize, pos.y.floor() as usize);
+    let bb = frame.get(pos.x.ceil() as usize, pos.y.ceil() as usize);
+
+    let u_x = pos.x.fract();
+    let u_y = pos.y.fract();
+    let a = lerp(u_y, aa, ab);
+    let b = lerp(u_y, ba, bb);
+
+    lerp(u_x, a, b)
+}
+
+#[inline(always)]
+fn lerp(u: f32, a: flow::Vec2, b: flow::Vec2) -> flow::Vec2 {
+    a * (1.0 - u) + b * u
 }
