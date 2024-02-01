@@ -8,6 +8,10 @@ struct VertexOutput {
     @location(0) tex_coords: vec2<f32>,
 }
 
+struct FragmentOpts {
+    @location(0) position: vec3<f32>,
+}
+
 @vertex
 fn vs_main(
     model: VertexInput,
@@ -22,8 +26,11 @@ fn vs_main(
 var t_diffuse: texture_2d<f32>;
 @group(0) @binding(1)
 var s_diffuse: sampler;
+@group(0) @binding(2)
+var<uniform> max_velocity: f32;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    var color = textureSample(t_diffuse, s_diffuse, in.tex_coords);
+    return vec4<f32>(color.rrr / max_velocity, 1.0);
 }
