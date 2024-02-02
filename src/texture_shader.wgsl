@@ -27,15 +27,12 @@ var velocity_texture: texture_2d<f32>;
 @group(0) @binding(1)
 var velocity_sampler: sampler;
 @group(0) @binding(2)
-var<uniform> max_velocity: f32;
-@group(0) @binding(3)
 var color_map_texture: texture_1d<f32>;
-@group(0) @binding(4)
+@group(0) @binding(3)
 var color_map_sampler: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let velocity = textureSample(velocity_texture, velocity_sampler, in.tex_coords).r;
-    let normalized = velocity / max_velocity;
-    return textureSample(color_map_texture, color_map_sampler, normalized);
+    return textureSample(color_map_texture, color_map_sampler, velocity);
 }

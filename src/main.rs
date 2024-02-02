@@ -6,13 +6,14 @@ use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowBuilder};
+use winit::window::{Theme, Window, WindowBuilder};
 
 use crate::color_map::ColorMap;
 
 mod color_map;
 mod flow;
 
+const DEFAULT_SCALE: u32 = 4;
 const COLOR_MAPS: [&ColorMap; 3] = [&color_map::GRAY, &color_map::INFERNO, &color_map::VIRIDIS];
 
 const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
@@ -39,13 +40,14 @@ async fn run() -> anyhow::Result<()> {
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-    const SCALE: u32 = 4;
     const CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
-        width: SCALE * flow::X_CELLS as u32,
-        height: SCALE * flow::Y_CELLS as u32,
+        width: DEFAULT_SCALE * flow::X_CELLS as u32,
+        height: DEFAULT_SCALE * flow::Y_CELLS as u32,
     };
     window.set_min_inner_size(Some(CONTENT_SIZE));
     window.set_max_inner_size(Some(CONTENT_SIZE));
+    window.set_title("flowvis");
+    window.set_theme(Some(Theme::Dark));
 
     let mut state = State::new(window, flow_field).await;
 
@@ -118,6 +120,7 @@ struct State {
     uploaded_color_map: usize,
     mouse_pos: flow::Pos2,
     line_origins: Vec<flow::Pos2>,
+    interactive_line: bool,
     lines_invalidated: bool,
     flow_field: flow::Field,
 }
@@ -217,6 +220,7 @@ impl State {
             uploaded_color_map: current_color_map,
             mouse_pos: flow::Pos2 { x: 30.0, y: 25.0 },
             line_origins: Vec::new(),
+            interactive_line: true,
             lines_invalidated: true,
             flow_field,
         }
@@ -275,6 +279,26 @@ impl State {
                     );
                     true
                 }
+                KeyCode::KeyI => {
+                    self.interactive_line = !self.interactive_line;
+                    self.lines_invalidated = true;
+                    true
+                }
+                KeyCode::KeyL => {
+                    self.line_origins.clear();
+                    self.line_origins
+                        .extend((0..2 * flow::Y_CELLS).map(|i| flow::Pos2 {
+                            x: 0.0,
+                            y: i as f32 / 2.0 - 1.0,
+                        }));
+                    self.lines_invalidated = true;
+                    true
+                }
+                KeyCode::Delete => {
+                    self.line_origins.clear();
+                    self.lines_invalidated = true;
+                    true
+                }
                 _ => false,
             },
             WindowEvent::CursorMoved { position, .. } => {
@@ -327,9 +351,11 @@ impl State {
                 &self.queue,
                 &self.bg_pipeline.velocity_texture,
                 self.flow_field.frame(self.current_frame),
+                self.flow_field.max_velocity,
             );
             self.last_frame_uploaded = now;
             self.uploaded_frame = self.current_frame;
+            log::debug!("frame_delta = {actual_delta:?}");
         }
         if self.current_color_map != self.uploaded_color_map {
             write_color_map_to_texture(
@@ -352,13 +378,16 @@ impl State {
                     *p,
                 );
             }
-            compute_stream_line(
-                &mut pl.vertices,
-                &mut pl.indices,
-                &self.flow_field,
-                self.current_frame,
-                self.mouse_pos,
-            );
+            if self.interactive_line {
+                compute_stream_line(
+                    &mut pl.vertices,
+                    &mut pl.indices,
+                    &self.flow_field,
+                    self.current_frame,
+                    self.mouse_pos,
+                );
+            }
+            log::debug!("line vertices = {}", pl.vertices.len());
             update_buffer(
                 &self.device,
                 &self.queue,
@@ -430,7 +459,7 @@ impl State {
                 render_pass.set_pipeline(&pl.render_pipeline);
                 render_pass.set_bind_group(0, &pl.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..2 * pl.indices.len() as u32, 0, 0..1);
             }
         }
@@ -455,7 +484,7 @@ struct BgPipeline {
 struct FieldLinePipeline {
     render_pipeline: wgpu::RenderPipeline,
     vertices: Vec<ColorVertex>,
-    indices: Vec<[u16; 2]>,
+    indices: Vec<[u32; 2]>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -536,7 +565,12 @@ fn create_bg_pipeline(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
+    write_frame_to_texture(
+        queue,
+        &velocity_texture,
+        flow_field.frame(current_frame),
+        flow_field.max_velocity,
+    );
     let velocity_texture_view =
         velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -550,12 +584,6 @@ fn create_bg_pipeline(
         min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::FilterMode::Nearest,
         ..Default::default()
-    });
-
-    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("max_velocity_buffer"),
-        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
 
     let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -581,63 +609,52 @@ fn create_bg_pipeline(
         ..Default::default()
     });
 
-    let texture_bind_group_layout =
-        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("bind_group_layout_1"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: filter },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("bind_group_layout_1"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: filter },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field of the texture
-                    ty: wgpu::BindingType::Sampler(match filter {
-                        true => wgpu::SamplerBindingType::Filtering,
-                        false => wgpu::SamplerBindingType::NonFiltering,
-                    }),
-                    count: None,
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                // should match filterable field of the texture
+                ty: wgpu::BindingType::Sampler(match filter {
+                    true => wgpu::SamplerBindingType::Filtering,
+                    false => wgpu::SamplerBindingType::NonFiltering,
+                }),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D1,
+                    multisampled: false,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D1,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    // should match filterable field of the texture
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                // should match filterable field of the texture
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
 
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("bind_group_1"),
-        layout: &texture_bind_group_layout,
+        layout: &bind_group_layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -649,14 +666,10 @@ fn create_bg_pipeline(
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: max_velocity_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
             },
             wgpu::BindGroupEntry {
-                binding: 4,
+                binding: 3,
                 resource: wgpu::BindingResource::Sampler(&color_map_sampler),
             },
         ],
@@ -668,7 +681,7 @@ fn create_bg_pipeline(
     });
     let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("render_pipline_layout_1"),
-        bind_group_layouts: &[&texture_bind_group_layout],
+        bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
 
@@ -744,9 +757,17 @@ fn create_bg_pipeline(
     }
 }
 
-fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: flow::Frame) {
+fn write_frame_to_texture(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    frame: flow::Frame,
+    max_velocity: f32,
+) {
     type PixelType = f32;
-    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
+    let velocities = frame
+        .iter()
+        .map(|v| v.norm() / max_velocity)
+        .collect::<Vec<PixelType>>();
 
     let pixel_size = std::mem::size_of::<PixelType>() as u32;
     let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
@@ -940,7 +961,7 @@ fn update_buffer<T: bytemuck::NoUninit>(
 
 fn compute_stream_line(
     vertices: &mut Vec<ColorVertex>,
-    indices: &mut Vec<[u16; 2]>,
+    indices: &mut Vec<[u32; 2]>,
     flow_field: &flow::Field,
     current_frame: usize,
     start_pos: flow::Pos2,
@@ -957,14 +978,20 @@ fn compute_stream_line(
     let first_index = vertices.len();
     let mut empty = true;
     let mut pos = start_pos;
-    let step_size = 0.5;
+
+    const MIN_VELOCITY: f32 = 0.01;
+    const MAX_NUM_STEPS: usize = 100_000;
+    const STEP_SIZE: f32 = 0.5;
     loop {
         let velocity = bilinear_lookup(&frame, pos);
-        if velocity.norm() < f32::EPSILON {
+        if velocity.norm() < MIN_VELOCITY {
+            break;
+        }
+        if vertices.len() - first_index > MAX_NUM_STEPS {
             break;
         }
 
-        pos += velocity * step_size;
+        pos += velocity * STEP_SIZE;
         if pos.x < 0.0
             || pos.y < 0.0
             || pos.x > (flow::X_CELLS - 1) as f32
@@ -988,7 +1015,7 @@ fn compute_stream_line(
     }
 
     if first_index < vertices.len() {
-        indices.extend((first_index..vertices.len() - 1).map(|i| [i as u16, i as u16 + 1]));
+        indices.extend((first_index..vertices.len() - 1).map(|i| [i as u32, i as u32 + 1]));
     }
 }
 
