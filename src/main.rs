@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use cgmath::{Matrix4, SquareMatrix, Vector2, Vector4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{Event, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Theme, Window, WindowBuilder};
@@ -103,6 +103,7 @@ struct State {
     path_line_pipeline: FieldLinePipeline,
 
     mouse: Mouse,
+    keyboard: Keyboard,
     transform: Transform,
     transform_buffer: wgpu::Buffer,
 
@@ -119,12 +120,25 @@ struct State {
     flow_field: flow::Field,
 }
 
+#[derive(Default)]
 struct Mouse {
     /// Normalized mouse position, interval: [-1, 1]
     pos: Option<Vector2<f32>>,
     // left_down: bool,
     // right_down: bool,
     middle_down: bool,
+}
+
+#[derive(Default)]
+struct Keyboard {
+    l_ctrl_down: bool,
+    r_ctrl_down: bool,
+}
+
+impl Keyboard {
+    pub fn ctrl_down(&self) -> bool {
+        self.l_ctrl_down || self.r_ctrl_down
+    }
 }
 
 struct Transform {
@@ -146,6 +160,15 @@ impl Default for Transform {
 impl Transform {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn pan_by(&mut self, delta: Vector2<f32>) {
+        let Vector2 { x, y } = self.offset + delta;
+        self.offset = Vector2::new(x.clamp(-2.0, 2.0), y.clamp(-2.0, 2.0));
+    }
+
+    pub fn zoom_by(&mut self, steps: f32) {
+        self.zoom = (self.zoom + 0.125 * steps).clamp(0.125, 20.0);
     }
 }
 
@@ -299,10 +322,8 @@ impl State {
             bg_pipeline,
             path_line_pipeline,
 
-            mouse: Mouse {
-                pos: None,
-                middle_down: false,
-            },
+            mouse: Mouse::default(),
+            keyboard: Keyboard::default(),
             transform,
             transform_buffer,
 
@@ -339,28 +360,36 @@ impl State {
                 event:
                     KeyEvent {
                         physical_key: PhysicalKey::Code(keycode),
-                        state: ElementState::Pressed,
+                        state: key_state,
                         ..
                     },
                 ..
             } => match keycode {
-                KeyCode::Space => {
+                KeyCode::ControlLeft => {
+                    self.keyboard.l_ctrl_down = key_state.is_pressed();
+                    true
+                }
+                KeyCode::ControlRight => {
+                    self.keyboard.r_ctrl_down = key_state.is_pressed();
+                    true
+                }
+                KeyCode::Space if key_state.is_pressed() => {
                     self.play = !self.play;
                     true
                 }
-                KeyCode::Comma => {
+                KeyCode::Comma if key_state.is_pressed() => {
                     self.prev_frame();
                     true
                 }
-                KeyCode::Period => {
+                KeyCode::Period if key_state.is_pressed() => {
                     self.next_frame();
                     true
                 }
-                KeyCode::KeyC => {
+                KeyCode::KeyC if key_state.is_pressed() => {
                     self.current_color_map = (self.current_color_map + 1) % COLOR_MAPS.len();
                     true
                 }
-                KeyCode::KeyF => {
+                KeyCode::KeyF if key_state.is_pressed() => {
                     self.filter = !self.filter;
                     self.bg_pipeline = create_bg_pipeline(
                         &self.device,
@@ -374,12 +403,12 @@ impl State {
                     );
                     true
                 }
-                KeyCode::KeyI => {
+                KeyCode::KeyI if key_state.is_pressed() => {
                     self.interactive_line = !self.interactive_line;
                     self.lines_invalidated = true;
                     true
                 }
-                KeyCode::KeyL => {
+                KeyCode::KeyL if key_state.is_pressed() => {
                     self.line_origins.clear();
                     self.line_origins
                         .extend((0..flow::Y_CELLS).map(|i| flow::Pos2 {
@@ -389,12 +418,21 @@ impl State {
                     self.lines_invalidated = true;
                     true
                 }
-                KeyCode::Delete => {
+                KeyCode::Delete if key_state.is_pressed() => {
                     self.line_origins.clear();
                     self.lines_invalidated = true;
                     true
                 }
-                KeyCode::Backspace => {
+
+                KeyCode::Minus if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.transform.zoom_by(-1.0);
+                    true
+                }
+                KeyCode::Equal if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.transform.zoom_by(1.0);
+                    true
+                }
+                KeyCode::Backspace if key_state.is_pressed() && self.keyboard.ctrl_down() => {
                     self.transform.reset();
                     true
                 }
@@ -419,7 +457,7 @@ impl State {
                 if self.mouse.middle_down {
                     if let Some(old_pos) = self.mouse.pos {
                         let delta = new_pos - old_pos;
-                        self.transform.offset += delta;
+                        self.transform.pan_by(delta);
                     }
                 } else {
                     self.mouse.pos = in_bounds.then_some(new_pos);
@@ -435,7 +473,7 @@ impl State {
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
                     winit::event::MouseScrollDelta::LineDelta(_x, y) => {
-                        self.transform.zoom += 0.25 * y;
+                        self.transform.zoom_by(*y);
                         true
                     }
                     winit::event::MouseScrollDelta::PixelDelta(_) => {
@@ -448,18 +486,18 @@ impl State {
             // WindowEvent::TouchpadMagnify { device_id, delta, phase } => (),
             // WindowEvent::TouchpadRotate { device_id, delta, phase } => (),
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state: button_state,
                 button,
                 ..
             } => match button {
-                MouseButton::Left => {
+                MouseButton::Left if button_state.is_pressed() => {
                     if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
                         self.line_origins.push(flow_pos);
                         self.lines_invalidated = true;
                     }
                     true
                 }
-                MouseButton::Right => {
+                MouseButton::Right if button_state.is_pressed() => {
                     if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
                         self.line_origins.retain(|&o| (o - flow_pos).norm() >= 0.5);
                         self.lines_invalidated = true;
@@ -467,25 +505,10 @@ impl State {
                     true
                 }
                 MouseButton::Middle => {
-                    self.mouse.middle_down = true;
+                    self.mouse.middle_down = button_state.is_pressed();
                     true
                 }
-                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => false,
-            },
-            WindowEvent::MouseInput {
-                state: ElementState::Released,
-                button,
-                ..
-            } => match button {
-                MouseButton::Middle => {
-                    self.mouse.middle_down = false;
-                    true
-                }
-                MouseButton::Left
-                | MouseButton::Right
-                | MouseButton::Back
-                | MouseButton::Forward
-                | MouseButton::Other(_) => false,
+                _ => false,
             },
             _ => false,
         }
