@@ -70,6 +70,10 @@ impl Vec2 {
     pub fn norm(&self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
     }
+
+    pub fn norm_squared(&self) -> f32 {
+        self.x * self.x + self.y * self.y
+    }
 }
 
 impl std::ops::Mul<f32> for Vec2 {
@@ -132,4 +136,8 @@ impl std::ops::AddAssign<Vec2> for Pos2 {
         self.x += rhs.x;
         self.y += rhs.y;
     }
+}
+
+pub fn in_bounds(pos: Pos2) -> bool {
+    (0.0..(X_CELLS - 1) as f32).contains(&pos.x) && (0.0..(Y_CELLS - 1) as f32).contains(&pos.y)
 }

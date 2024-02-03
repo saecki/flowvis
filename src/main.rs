@@ -147,6 +147,7 @@ struct BgState {
 
 struct LineState {
     visible: bool,
+    method: LineMethod,
     origins: Vec<flow::Pos2>,
     /// draw a line at the cursor position
     interactive: bool,
@@ -154,6 +155,27 @@ struct LineState {
     invalidated: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineMethod {
+    /// Euler
+    Euler,
+    /// Runge-Kutta method of order 2
+    Rk2,
+    /// Runge-Kutta method of order 4
+    Rk4,
+}
+
+impl LineMethod {
+    fn cycle(&mut self) {
+        use LineMethod::*;
+        *self = match self {
+            Euler => Rk2,
+            Rk2 => Rk4,
+            Rk4 => Euler,
+        }
+    }
 }
 
 struct ArrowState {
@@ -225,7 +247,7 @@ impl Transform {
         for _ in 0..steps.abs() {
             new *= factor;
         }
-        self.zoom = new.clamp(0.125, 20.0);
+        self.zoom = new.clamp(0.125, 100.0);
     }
 }
 
@@ -377,6 +399,7 @@ impl State {
 
         let mut line = LineState {
             visible: false,
+            method: LineMethod::Rk4,
             origins: Vec::new(),
             interactive: false,
             invalidated: true,
@@ -546,6 +569,11 @@ impl State {
                     self.line.invalidated = true;
                     true
                 }
+                KeyCode::KeyM if key_state.is_pressed() => {
+                    self.line.method.cycle();
+                    self.line.invalidated = true;
+                    true
+                }
                 KeyCode::KeyL if key_state.is_pressed() && self.keyboard.shift_down() => {
                     spawn_lines2(&mut self.line);
                     true
@@ -562,6 +590,7 @@ impl State {
                 _ => false,
             },
             WindowEvent::CursorMoved { position, .. } => {
+                // TODO: maybe highlight hovered lines?
                 let aspect = self.config.width as f32 / self.config.height as f32;
                 let transform_mat = self.transform.build_matrix(aspect);
                 let homogeneous = Vector4::new(
@@ -621,10 +650,14 @@ impl State {
                     true
                 }
                 MouseButton::Right if button_state.is_pressed() => {
+                    // TODO: store vertex_buffer indices of line origins, delete lines by clicking
+                    // anywhere on them
                     if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
+                        let scaled_dist = 1.0 / self.transform.zoom;
+                        let squared_dist = scaled_dist * scaled_dist;
                         self.line
                             .origins
-                            .retain(|&o| (o - flow_pos).norm() >= 1.0 / self.transform.zoom);
+                            .retain(|&o| (o - flow_pos).norm_squared() >= squared_dist);
                         self.line.invalidated = true;
                     }
                     true
@@ -721,44 +754,7 @@ impl State {
 
         // arrow
         if arrow.visible && arrow.invalidated {
-            let pl = &mut self.line_pipeline;
-            pl.vertices.clear();
-            pl.indices.clear();
-            for p in line.origins.iter() {
-                compute_stream_line(
-                    &mut pl.vertices,
-                    &mut pl.indices,
-                    &self.flow_field,
-                    playback.current_frame,
-                    *p,
-                );
-            }
-            if line.interactive {
-                if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
-                    compute_stream_line(
-                        &mut pl.vertices,
-                        &mut pl.indices,
-                        &self.flow_field,
-                        playback.current_frame,
-                        flow_pos,
-                    );
-                }
-            }
-            log::debug!("line vertices = {}", pl.vertices.len());
-            update_buffer(
-                &self.device,
-                &self.queue,
-                &mut pl.vertex_buffer,
-                &pl.vertices,
-                wgpu::BufferUsages::VERTEX,
-            );
-            update_buffer(
-                &self.device,
-                &self.queue,
-                &mut pl.index_buffer,
-                &pl.indices,
-                wgpu::BufferUsages::INDEX,
-            );
+            // TODO
         }
     }
 
@@ -1565,11 +1561,25 @@ fn compute_lines(
     vertices.clear();
     indices.clear();
     for p in line.origins.iter() {
-        compute_stream_line(vertices, indices, &flow_field, current_frame, *p);
+        compute_stream_line(
+            vertices,
+            indices,
+            &flow_field,
+            current_frame,
+            *p,
+            line.method,
+        );
     }
     if line.interactive {
         if let Some(flow_pos) = mouse_pos.and_then(normalized_to_flow_pos) {
-            compute_stream_line(vertices, indices, &flow_field, current_frame, flow_pos);
+            compute_stream_line(
+                vertices,
+                indices,
+                &flow_field,
+                current_frame,
+                flow_pos,
+                line.method,
+            );
         }
     }
 }
@@ -1580,6 +1590,7 @@ fn compute_stream_line(
     flow_field: &flow::Field,
     current_frame: usize,
     start_pos: flow::Pos2,
+    method: LineMethod,
 ) {
     fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 3] {
         [
@@ -1593,44 +1604,79 @@ fn compute_stream_line(
     let first_index = vertices.len();
     let mut empty = true;
     let mut pos = start_pos;
+    let mut v0 = bilinear_lookup(&frame, pos);
 
     const MIN_VELOCITY: f32 = 0.01;
-    const MAX_NUM_STEPS: usize = 100_000;
+    const MAX_NUM_STEPS: usize = 10_000;
     const STEP_SIZE: f32 = 0.5;
     loop {
-        let velocity = bilinear_lookup(&frame, pos);
-        if velocity.norm() < MIN_VELOCITY {
+        // RK4 method
+        let k1 = v0 * STEP_SIZE;
+        match method {
+            LineMethod::Euler => {
+                pos += k1;
+            }
+            LineMethod::Rk2 => {
+                let p1 = pos + k1;
+                if !flow::in_bounds(p1) {
+                    break;
+                }
+                let k2 = bilinear_lookup(&frame, p1) * STEP_SIZE;
+                pos += (k1 + k2) * 0.5;
+            }
+            LineMethod::Rk4 => {
+                let p1 = pos + k1 * 0.5;
+                if !flow::in_bounds(p1) {
+                    break;
+                }
+                let k2 = bilinear_lookup(&frame, p1) * STEP_SIZE;
+                let p2 = pos + k2 * 0.5;
+                if !flow::in_bounds(p2) {
+                    break;
+                }
+                let k3 = bilinear_lookup(&frame, p2) * STEP_SIZE;
+                let p3 = pos + k3;
+                if !flow::in_bounds(p3) {
+                    break;
+                }
+                let k4 = bilinear_lookup(&frame, p3) * STEP_SIZE;
+                let p4 = pos + k4;
+                if !flow::in_bounds(p4) {
+                    break;
+                }
+
+                pos += (k1 + k2 + k3 + k4) * 0.25;
+            }
+        }
+        if !flow::in_bounds(pos) {
+            break;
+        }
+
+        let v1 = bilinear_lookup(&frame, pos);
+
+        if empty {
+            vertices.push(ScalarVertex {
+                position: flow_pos_to_wgpu_coord(start_pos),
+                scalar: v0.norm() / flow_field.max_velocity,
+            });
+            empty = false;
+        }
+        vertices.push(ScalarVertex {
+            position: flow_pos_to_wgpu_coord(pos),
+            scalar: v1.norm() / flow_field.max_velocity,
+        });
+
+        if v1.norm() < MIN_VELOCITY {
             break;
         }
         if vertices.len() - first_index > MAX_NUM_STEPS {
             break;
         }
 
-        // TODO: runge-kutta method
-        pos += velocity * STEP_SIZE;
-        if pos.x < 0.0
-            || pos.y < 0.0
-            || pos.x > (flow::X_CELLS - 1) as f32
-            || pos.y > (flow::Y_CELLS - 1) as f32
-        {
-            break;
-        }
-
-        let color = velocity.norm() / flow_field.max_velocity;
-        if empty {
-            vertices.push(ScalarVertex {
-                position: flow_pos_to_wgpu_coord(start_pos),
-                scalar: color,
-            });
-            empty = false;
-        }
-        vertices.push(ScalarVertex {
-            position: flow_pos_to_wgpu_coord(pos),
-            scalar: color,
-        });
+        v0 = v1;
     }
 
-    if first_index < vertices.len() {
+    if !empty {
         indices.extend((first_index..vertices.len() - 1).map(|i| [i as u32, i as u32 + 1]));
     }
 }
