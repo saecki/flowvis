@@ -8,13 +8,16 @@ struct VertexOutput {
     @location(0) color: f32,
 }
 
+@group(0) @binding(8)
+var<uniform> transform: mat4x4<f32>;
+
 @vertex
 fn vs_main(
     model: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
     out.color = model.color;
-    out.clip_position = vec4<f32>(model.position, 1.0);
+    out.clip_position = transform * vec4<f32>(model.position, 1.0);
     return out;
 }
 

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
+use cgmath::{Matrix4, SquareMatrix, Vector2, Vector4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, MouseButton, WindowEvent};
@@ -40,12 +41,11 @@ async fn run() -> anyhow::Result<()> {
 
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new().build(&event_loop).unwrap();
-    const CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
+    const DEFAULT_CONTENT_SIZE: PhysicalSize<u32> = PhysicalSize {
         width: DEFAULT_SCALE * flow::X_CELLS as u32,
         height: DEFAULT_SCALE * flow::Y_CELLS as u32,
     };
-    window.set_min_inner_size(Some(CONTENT_SIZE));
-    window.set_max_inner_size(Some(CONTENT_SIZE));
+    _ = window.request_inner_size(DEFAULT_CONTENT_SIZE);
     window.set_title("flowvis");
     window.set_theme(Some(Theme::Dark));
 
@@ -69,16 +69,7 @@ async fn run() -> anyhow::Result<()> {
                             Err(e) => eprintln!("{e}"),
                         }
                     }
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
-                        event:
-                            KeyEvent {
-                                physical_key: PhysicalKey::Code(KeyCode::Escape),
-                                state: ElementState::Pressed,
-                                ..
-                            },
-                        ..
-                    } => {
+                    WindowEvent::CloseRequested => {
                         window_target.exit();
                     }
                     WindowEvent::Resized(physical_size) => {
@@ -111,6 +102,10 @@ struct State {
     bg_pipeline: BgPipeline,
     path_line_pipeline: FieldLinePipeline,
 
+    mouse: Mouse,
+    transform: Transform,
+    transform_buffer: wgpu::Buffer,
+
     filter: bool,
     play: bool,
     last_frame_uploaded: Instant,
@@ -118,11 +113,92 @@ struct State {
     uploaded_frame: usize,
     current_color_map: usize,
     uploaded_color_map: usize,
-    mouse_pos: flow::Pos2,
     line_origins: Vec<flow::Pos2>,
     interactive_line: bool,
     lines_invalidated: bool,
     flow_field: flow::Field,
+}
+
+struct Mouse {
+    /// Normalized mouse position, interval: [-1, 1]
+    pos: Option<Vector2<f32>>,
+    // left_down: bool,
+    // right_down: bool,
+    middle_down: bool,
+}
+
+struct Transform {
+    offset: Vector2<f32>,
+    zoom: f32,
+    rotation: f32,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self {
+            offset: Vector2::new(0.0, 0.0),
+            zoom: 1.0,
+            rotation: 0.0,
+        }
+    }
+}
+
+impl Transform {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl Transform {
+    fn build_matrix(&self, aspect: f32) -> Matrix4<f32> {
+        let Self {
+            offset,
+            zoom,
+            rotation,
+        } = *self;
+
+        #[rustfmt::skip]
+        let offset_mat = Matrix4::new(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            offset.x, offset.y, 0.0, 1.0,
+        );
+        #[rustfmt::skip]
+        let zoom_mat = Matrix4::new(
+            zoom, 0.0, 0.0, 0.0,
+            0.0, zoom, 0.0, 0.0,
+            0.0, 0.0, zoom, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        );
+        #[rustfmt::skip]
+        let rot_mat = Matrix4::new(
+            rotation.cos(), rotation.sin(), 0.0, 0.0,
+            -rotation.sin(), rotation.cos(), 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        );
+        #[rustfmt::skip]
+        let aspect_mat = Matrix4::new(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, aspect,  0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        );
+
+        zoom_mat * offset_mat * aspect_mat * rot_mat
+    }
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct TranformUniform([[f32; 4]; 4]);
+
+impl From<Matrix4<f32>> for TranformUniform {
+    fn from(value: Matrix4<f32>) -> Self {
+        // SAFETY: Matrix4<f32> is layed out the same
+        unsafe { std::mem::transmute(value) }
+    }
 }
 
 impl State {
@@ -185,6 +261,17 @@ impl State {
         };
         surface.configure(&device, &config);
 
+        let transform = Transform::default();
+        let aspect = config.width as f32 / config.height as f32;
+        let transform_uniform: TranformUniform = transform.build_matrix(aspect).into();
+        let transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("transform_buffer"),
+            contents: bytemuck::cast_slice(&[transform_uniform]),
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST,
+        });
+
         let current_frame = 0;
         let current_color_map = 0;
         let filter = true;
@@ -193,12 +280,13 @@ impl State {
             &queue,
             &config,
             &flow_field,
+            &transform_buffer,
             current_frame,
             current_color_map,
             filter,
         );
 
-        let path_line_pipeline = create_line_pipeline(&device, &queue, &config);
+        let path_line_pipeline = create_line_pipeline(&device, &queue, &config, &transform_buffer);
 
         Self {
             window,
@@ -211,6 +299,13 @@ impl State {
             bg_pipeline,
             path_line_pipeline,
 
+            mouse: Mouse {
+                pos: None,
+                middle_down: false,
+            },
+            transform,
+            transform_buffer,
+
             filter,
             play: true,
             last_frame_uploaded: Instant::now(),
@@ -218,9 +313,8 @@ impl State {
             uploaded_frame: current_frame,
             current_color_map,
             uploaded_color_map: current_color_map,
-            mouse_pos: flow::Pos2 { x: 30.0, y: 25.0 },
             line_origins: Vec::new(),
-            interactive_line: true,
+            interactive_line: false,
             lines_invalidated: true,
             flow_field,
         }
@@ -273,6 +367,7 @@ impl State {
                         &self.queue,
                         &self.config,
                         &self.flow_field,
+                        &self.transform_buffer,
                         self.current_frame,
                         self.current_color_map,
                         self.filter,
@@ -287,9 +382,9 @@ impl State {
                 KeyCode::KeyL => {
                     self.line_origins.clear();
                     self.line_origins
-                        .extend((0..2 * flow::Y_CELLS).map(|i| flow::Pos2 {
+                        .extend((0..flow::Y_CELLS).map(|i| flow::Pos2 {
                             x: 0.0,
-                            y: i as f32 / 2.0 - 1.0,
+                            y: i as f32,
                         }));
                     self.lines_invalidated = true;
                     true
@@ -299,38 +394,95 @@ impl State {
                     self.lines_invalidated = true;
                     true
                 }
+                KeyCode::Backspace => {
+                    self.transform.reset();
+                    true
+                }
                 _ => false,
             },
             WindowEvent::CursorMoved { position, .. } => {
-                let flow_pos = flow::Pos2 {
-                    x: (flow::X_CELLS - 1) as f32
-                        * (position.x as f32 / (self.size.width - 1) as f32),
+                let aspect = self.config.width as f32 / self.config.height as f32;
+                let transform_mat = self.transform.build_matrix(aspect);
+                let homogeneous = Vector4::new(
+                    2.0 * (position.x as f32 / (self.size.width - 1) as f32) - 1.0,
                     // flip y pos
-                    y: (flow::Y_CELLS - 1) as f32
-                        * (1.0 - position.y as f32 / (self.size.height - 1) as f32),
-                };
+                    -2.0 * (position.y as f32 / (self.size.height - 1) as f32) + 1.0,
+                    0.0,
+                    1.0,
+                );
+                let inverse_mat = transform_mat.invert().expect("should always be invertable");
+                let new_pos = inverse_mat * homogeneous;
+                let new_pos = Vector2::new(new_pos.x, new_pos.y);
 
-                self.mouse_pos = flow_pos;
+                let in_bounds =
+                    (-1.0..=1.0).contains(&new_pos.x) && (-1.0..=1.0).contains(&new_pos.y);
+                if self.mouse.middle_down {
+                    if let Some(old_pos) = self.mouse.pos {
+                        let delta = new_pos - old_pos;
+                        self.transform.offset += delta;
+                    }
+                } else {
+                    self.mouse.pos = in_bounds.then_some(new_pos);
+                }
                 self.lines_invalidated = true;
+
                 true
             }
+            WindowEvent::CursorLeft { .. } => {
+                self.mouse.pos = None;
+                true
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                        self.transform.zoom += 0.25 * y;
+                        true
+                    }
+                    winit::event::MouseScrollDelta::PixelDelta(_) => {
+                        // TODO
+                        true
+                    }
+                }
+            }
+            // TODO: handle touchpad events
+            // WindowEvent::TouchpadMagnify { device_id, delta, phase } => (),
+            // WindowEvent::TouchpadRotate { device_id, delta, phase } => (),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button,
                 ..
             } => match button {
                 MouseButton::Left => {
-                    self.line_origins.push(self.mouse_pos);
-                    self.lines_invalidated = true;
+                    if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
+                        self.line_origins.push(flow_pos);
+                        self.lines_invalidated = true;
+                    }
                     true
                 }
                 MouseButton::Right => {
-                    self.line_origins
-                        .retain(|&o| (o - self.mouse_pos).norm() >= 1.0);
-                    self.lines_invalidated = true;
+                    if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
+                        self.line_origins.retain(|&o| (o - flow_pos).norm() >= 0.5);
+                        self.lines_invalidated = true;
+                    }
                     true
                 }
-                MouseButton::Middle
+                MouseButton::Middle => {
+                    self.mouse.middle_down = true;
+                    true
+                }
+                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => false,
+            },
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button,
+                ..
+            } => match button {
+                MouseButton::Middle => {
+                    self.mouse.middle_down = false;
+                    true
+                }
+                MouseButton::Left
+                | MouseButton::Right
                 | MouseButton::Back
                 | MouseButton::Forward
                 | MouseButton::Other(_) => false,
@@ -340,6 +492,14 @@ impl State {
     }
 
     fn update(&mut self) {
+        let aspect = self.config.width as f32 / self.config.height as f32;
+        let transform_uniform: TranformUniform = self.transform.build_matrix(aspect).into();
+        self.queue.write_buffer(
+            &self.transform_buffer,
+            0,
+            bytemuck::cast_slice(&[transform_uniform]),
+        );
+
         let now = Instant::now();
         let desired_delta = Duration::from_secs_f32(flow::T_STEP);
         let actual_delta = now.duration_since(self.last_frame_uploaded);
@@ -379,13 +539,15 @@ impl State {
                 );
             }
             if self.interactive_line {
-                compute_stream_line(
-                    &mut pl.vertices,
-                    &mut pl.indices,
-                    &self.flow_field,
-                    self.current_frame,
-                    self.mouse_pos,
-                );
+                if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
+                    compute_stream_line(
+                        &mut pl.vertices,
+                        &mut pl.indices,
+                        &self.flow_field,
+                        self.current_frame,
+                        flow_pos,
+                    );
+                }
             }
             log::debug!("line vertices = {}", pl.vertices.len());
             update_buffer(
@@ -551,6 +713,7 @@ fn create_bg_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     flow_field: &flow::Field,
+    transform_buffer: &wgpu::Buffer,
     current_frame: usize,
     current_color_map: usize,
     filter: bool,
@@ -649,6 +812,16 @@ fn create_bg_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -671,6 +844,10 @@ fn create_bg_pipeline(
             wgpu::BindGroupEntry {
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(&color_map_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: transform_buffer.as_entire_binding(),
             },
         ],
     });
@@ -724,10 +901,10 @@ fn create_bg_pipeline(
 
     #[rustfmt::skip]
     const BG_VERTICES: &[TextureVertex] = &[
-        TextureVertex { position: [-1.0, -1.0, 0.0], tex_coords: [0.0, 1.0] },
-        TextureVertex { position: [ 1.0, -1.0, 0.0], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [ 1.0,  1.0, 0.0], tex_coords: [1.0, 0.0] },
-        TextureVertex { position: [-1.0,  1.0, 0.0], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [-1.0, -0.125, 0.0], tex_coords: [0.0, 1.0] },
+        TextureVertex { position: [ 1.0, -0.125, 0.0], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [ 1.0,  0.125, 0.0], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [-1.0,  0.125, 0.0], tex_coords: [0.0, 0.0] },
     ];
     #[rustfmt::skip]
     const BG_INDICES: &[u16] = &[
@@ -803,6 +980,7 @@ fn create_line_pipeline(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
+    transform_buffer: &wgpu::Buffer,
 ) -> FieldLinePipeline {
     let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("color_map_texture_1"),
@@ -848,6 +1026,16 @@ fn create_line_pipeline(
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 8,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -862,6 +1050,10 @@ fn create_line_pipeline(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: wgpu::BindingResource::Sampler(&color_map_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: transform_buffer.as_entire_binding(),
             },
         ],
     });
@@ -969,7 +1161,7 @@ fn compute_stream_line(
     fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 3] {
         [
             2.0 * (pos.x / (flow::X_CELLS - 1) as f32) - 1.0,
-            2.0 * (pos.y / (flow::Y_CELLS - 1) as f32) - 1.0,
+            0.25 * (pos.y / (flow::Y_CELLS - 1) as f32) - 0.125,
             0.0,
         ]
     }
@@ -991,6 +1183,7 @@ fn compute_stream_line(
             break;
         }
 
+        // TODO: runge-kutta method
         pos += velocity * STEP_SIZE;
         if pos.x < 0.0
             || pos.y < 0.0
@@ -1036,4 +1229,11 @@ fn bilinear_lookup(frame: &flow::Frame, pos: flow::Pos2) -> flow::Vec2 {
 #[inline(always)]
 fn lerp(u: f32, a: flow::Vec2, b: flow::Vec2) -> flow::Vec2 {
     a * (1.0 - u) + b * u
+}
+
+fn normalized_to_flow_pos(pos: Vector2<f32>) -> Option<flow::Pos2> {
+    (-0.125..=0.125).contains(&pos.y).then(|| flow::Pos2 {
+        x: 0.5 * (pos.x + 1.0) * (flow::X_CELLS - 1) as f32,
+        y: 4.0 * (pos.y + 0.125) * (flow::Y_CELLS - 1) as f32,
+    })
 }
