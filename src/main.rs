@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
+use cgmath::num_traits::Inv;
 use cgmath::{Matrix4, SquareMatrix, Vector2, Vector4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -139,12 +140,14 @@ impl PlaybackState {
 }
 
 struct BgState {
+    visible: bool,
     filter: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
 }
 
 struct LineState {
+    visible: bool,
     origins: Vec<flow::Pos2>,
     /// draw a line at the cursor position
     interactive: bool,
@@ -155,6 +158,7 @@ struct LineState {
 }
 
 struct ArrowState {
+    visible: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
 }
@@ -212,8 +216,16 @@ impl Transform {
         self.offset = Vector2::new(x.clamp(-2.0, 2.0), y.clamp(-2.0, 2.0));
     }
 
-    pub fn zoom_by(&mut self, steps: f32) {
-        self.zoom = (self.zoom + 0.125 * steps).clamp(0.125, 20.0);
+    pub fn zoom_discrete(&mut self, steps: i8) {
+        let mut new = self.zoom;
+        let mut factor = 1.1;
+        if steps < 0 {
+            factor = 1.0 / factor
+        }
+        for _ in 0..steps.abs() {
+            new *= factor;
+        }
+        self.zoom = new.clamp(0.125, 20.0);
     }
 }
 
@@ -348,6 +360,7 @@ impl State {
         };
 
         let bg = BgState {
+            visible: true,
             filter: true,
             current_color_map: 0,
             uploaded_color_map: 0,
@@ -363,6 +376,7 @@ impl State {
         );
 
         let line = LineState {
+            visible: true,
             origins: Vec::new(),
             interactive: false,
             invalidated: false,
@@ -372,6 +386,7 @@ impl State {
         let line_pipeline = create_line_pipeline(&device, &queue, &config, &transform_buffer);
 
         let arrow = ArrowState {
+            visible: false,
             current_color_map: 0,
             uploaded_color_map: 0,
         };
@@ -443,6 +458,22 @@ impl State {
                     self.keyboard.r_shift_down = key_state.is_pressed();
                     true
                 }
+
+                // transform
+                KeyCode::Minus if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.transform.zoom_discrete(-1);
+                    true
+                }
+                KeyCode::Equal if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.transform.zoom_discrete(1);
+                    true
+                }
+                KeyCode::Backspace if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.transform.reset();
+                    true
+                }
+
+                // playback
                 KeyCode::Space if key_state.is_pressed() => {
                     self.playback.play = !self.playback.play;
                     true
@@ -455,11 +486,36 @@ impl State {
                     self.playback.next_frame();
                     true
                 }
-                KeyCode::KeyC if key_state.is_pressed() => {
+
+                KeyCode::Digit1 if key_state.is_pressed() && self.keyboard.ctrl_down() => {
                     self.bg.current_color_map =
                         (self.bg.current_color_map + 1) % BG_COLOR_MAPS.len();
                     true
                 }
+                KeyCode::Digit1 if key_state.is_pressed() => {
+                    self.bg.visible = !self.bg.visible;
+                    true
+                }
+                KeyCode::Digit2 if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.line.current_color_map =
+                        (self.line.current_color_map + 1) % LINE_COLOR_MAPS.len();
+                    true
+                }
+                KeyCode::Digit2 if key_state.is_pressed() => {
+                    self.line.visible = !self.line.visible;
+                    true
+                }
+                KeyCode::Digit3 if key_state.is_pressed() && self.keyboard.ctrl_down() => {
+                    self.arrow.current_color_map =
+                        (self.arrow.current_color_map + 1) % ARROW_COLOR_MAPS.len();
+                    true
+                }
+                KeyCode::Digit3 if key_state.is_pressed() => {
+                    self.arrow.visible = !self.arrow.visible;
+                    true
+                }
+
+                // bg
                 KeyCode::KeyF if key_state.is_pressed() => {
                     self.bg.filter = !self.bg.filter;
                     self.bg_pipeline = create_bg_pipeline(
@@ -473,6 +529,8 @@ impl State {
                     );
                     true
                 }
+
+                // line
                 KeyCode::KeyI if key_state.is_pressed() => {
                     self.line.interactive = !self.line.interactive;
                     self.line.invalidated = true;
@@ -481,12 +539,10 @@ impl State {
                 KeyCode::KeyL if key_state.is_pressed() && self.keyboard.shift_down() => {
                     self.line.origins.clear();
                     let num = 4 * flow::Y_CELLS;
-                    self.line
-                        .origins
-                        .extend((0..num).map(|i| flow::Pos2 {
-                            x: 0.0,
-                            y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
-                        }));
+                    self.line.origins.extend((0..num).map(|i| flow::Pos2 {
+                        x: 0.0,
+                        y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
+                    }));
                     self.line.invalidated = true;
                     true
                 }
@@ -506,19 +562,6 @@ impl State {
                 KeyCode::Delete if key_state.is_pressed() => {
                     self.line.origins.clear();
                     self.line.invalidated = true;
-                    true
-                }
-
-                KeyCode::Minus if key_state.is_pressed() && self.keyboard.ctrl_down() => {
-                    self.transform.zoom_by(-1.0);
-                    true
-                }
-                KeyCode::Equal if key_state.is_pressed() && self.keyboard.ctrl_down() => {
-                    self.transform.zoom_by(1.0);
-                    true
-                }
-                KeyCode::Backspace if key_state.is_pressed() && self.keyboard.ctrl_down() => {
-                    self.transform.reset();
                     true
                 }
                 _ => false,
@@ -558,7 +601,7 @@ impl State {
             WindowEvent::MouseWheel { delta, .. } => {
                 match delta {
                     winit::event::MouseScrollDelta::LineDelta(_x, y) => {
-                        self.transform.zoom_by(*y);
+                        self.transform.zoom_discrete(*y as i8);
                         true
                     }
                     winit::event::MouseScrollDelta::PixelDelta(_) => {
@@ -584,7 +627,9 @@ impl State {
                 }
                 MouseButton::Right if button_state.is_pressed() => {
                     if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
-                        self.line.origins.retain(|&o| (o - flow_pos).norm() >= 0.5);
+                        self.line
+                            .origins
+                            .retain(|&o| (o - flow_pos).norm() >= 1.0 / self.transform.zoom);
                         self.line.invalidated = true;
                     }
                     true
@@ -620,12 +665,14 @@ impl State {
             playback.next_frame();
         }
         if playback.current_frame != playback.uploaded_frame {
-            write_frame_to_texture(
-                &self.queue,
-                &self.bg_pipeline.velocity_texture,
-                self.flow_field.frame(playback.current_frame),
-                self.flow_field.max_velocity,
-            );
+            if bg.visible {
+                write_frame_to_texture(
+                    &self.queue,
+                    &self.bg_pipeline.velocity_texture,
+                    self.flow_field.frame(playback.current_frame),
+                    self.flow_field.max_velocity,
+                );
+            }
             playback.last_frame_uploaded = now;
             playback.uploaded_frame = playback.current_frame;
             line.invalidated = true;
@@ -639,7 +686,16 @@ impl State {
             );
             bg.uploaded_color_map = bg.current_color_map;
         }
-        if line.invalidated {
+
+        if line.current_color_map != line.uploaded_color_map {
+            write_color_map_to_texture(
+                &self.queue,
+                &self.line_pipeline.color_map_texture,
+                LINE_COLOR_MAPS[line.current_color_map],
+            );
+            line.uploaded_color_map = line.current_color_map;
+        }
+        if line.visible && line.invalidated {
             let pl = &mut self.line_pipeline;
             pl.vertices.clear();
             pl.indices.clear();
@@ -713,22 +769,31 @@ impl State {
                 timestamp_writes: None,
             });
 
-            {
-                let bg = &self.bg_pipeline;
-                render_pass.set_pipeline(&bg.render_pipeline);
-                render_pass.set_bind_group(0, &bg.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, bg.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(bg.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..bg.num_indices, 0, 0..1);
+            if self.bg.visible {
+                let p = &self.bg_pipeline;
+                render_pass.set_pipeline(&p.render_pipeline);
+                render_pass.set_bind_group(0, &p.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..p.num_indices, 0, 0..1);
             }
 
-            {
-                let pl = &self.line_pipeline;
-                render_pass.set_pipeline(&pl.render_pipeline);
-                render_pass.set_bind_group(0, &pl.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..2 * pl.indices.len() as u32, 0, 0..1);
+            if self.line.visible {
+                let p = &self.line_pipeline;
+                render_pass.set_pipeline(&p.render_pipeline);
+                render_pass.set_bind_group(0, &p.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..2 * p.indices.len() as u32, 0, 0..1);
+            }
+
+            if self.arrow.visible {
+                let p = &self.arrow_pipeline;
+                render_pass.set_pipeline(&p.render_pipeline);
+                render_pass.set_bind_group(0, &p.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..3 * p.indices.len() as u32, 0, 0..1);
             }
         }
 
@@ -1362,7 +1427,7 @@ fn create_arrow_pipeline(
             })],
         }),
         primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::LineList,
+            topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
             cull_mode: Some(wgpu::Face::Back),
