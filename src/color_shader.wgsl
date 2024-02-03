@@ -1,11 +1,11 @@
 struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) color: f32,
+    @location(1) scalar: f32,
 }
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: f32,
+    @location(0) scalar: f32,
 }
 
 @group(0) @binding(8)
@@ -16,7 +16,7 @@ fn vs_main(
     model: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.color = model.color;
+    out.scalar = model.scalar;
     out.clip_position = transform * vec4<f32>(model.position, 1.0);
     return out;
 }
@@ -28,5 +28,5 @@ var color_map_sampler: sampler;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(color_map_texture, color_map_sampler, in.color);
+    return textureSample(color_map_texture, color_map_sampler, in.scalar);
 }
