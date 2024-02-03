@@ -172,11 +172,17 @@ struct Mouse {
 struct Keyboard {
     l_ctrl_down: bool,
     r_ctrl_down: bool,
+    l_shift_down: bool,
+    r_shift_down: bool,
 }
 
 impl Keyboard {
     pub fn ctrl_down(&self) -> bool {
         self.l_ctrl_down || self.r_ctrl_down
+    }
+
+    pub fn shift_down(&self) -> bool {
+        self.l_shift_down || self.r_shift_down
     }
 }
 
@@ -429,6 +435,14 @@ impl State {
                     self.keyboard.r_ctrl_down = key_state.is_pressed();
                     true
                 }
+                KeyCode::ShiftLeft => {
+                    self.keyboard.l_shift_down = key_state.is_pressed();
+                    true
+                }
+                KeyCode::ShiftRight => {
+                    self.keyboard.r_shift_down = key_state.is_pressed();
+                    true
+                }
                 KeyCode::Space if key_state.is_pressed() => {
                     self.playback.play = !self.playback.play;
                     true
@@ -464,14 +478,28 @@ impl State {
                     self.line.invalidated = true;
                     true
                 }
-                KeyCode::KeyL if key_state.is_pressed() => {
+                KeyCode::KeyL if key_state.is_pressed() && self.keyboard.shift_down() => {
                     self.line.origins.clear();
+                    let num = 4 * flow::Y_CELLS;
                     self.line
                         .origins
-                        .extend((0..flow::Y_CELLS).map(|i| flow::Pos2 {
+                        .extend((0..num).map(|i| flow::Pos2 {
                             x: 0.0,
-                            y: i as f32,
+                            y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
                         }));
+                    self.line.invalidated = true;
+                    true
+                }
+                KeyCode::KeyL if key_state.is_pressed() => {
+                    self.line.origins.clear();
+                    let num = 4 * flow::Y_CELLS;
+                    let new_origins = (0..num).map(|i| {
+                        let i = 2.0 * (i as f32 / (num - 1) as f32) - 1.0;
+                        let y = i.signum() * i.abs().powf(1.5);
+                        let pos = Vector2::new(-1.0, 0.125 * y);
+                        normalized_to_flow_pos(pos).unwrap()
+                    });
+                    self.line.origins.extend(new_origins);
                     self.line.invalidated = true;
                     true
                 }
