@@ -1,7 +1,6 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
-use cgmath::num_traits::Inv;
 use cgmath::{Matrix4, SquareMatrix, Vector2, Vector4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -159,6 +158,7 @@ struct LineState {
 
 struct ArrowState {
     visible: bool,
+    invalidated: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
 }
@@ -369,24 +369,34 @@ impl State {
             &device,
             &queue,
             &config,
-            &flow_field,
             &transform_buffer,
+            &flow_field,
             &bg,
             playback.current_frame,
         );
 
-        let line = LineState {
-            visible: true,
+        let mut line = LineState {
+            visible: false,
             origins: Vec::new(),
             interactive: false,
-            invalidated: false,
+            invalidated: true,
             current_color_map: 0,
             uploaded_color_map: 0,
         };
-        let line_pipeline = create_line_pipeline(&device, &queue, &config, &transform_buffer);
+        spawn_lines1(&mut line);
+        let line_pipeline = create_line_pipeline(
+            &device,
+            &queue,
+            &config,
+            &transform_buffer,
+            &flow_field,
+            &line,
+            playback.current_frame,
+        );
 
         let arrow = ArrowState {
             visible: false,
+            invalidated: false,
             current_color_map: 0,
             uploaded_color_map: 0,
         };
@@ -522,8 +532,8 @@ impl State {
                         &self.device,
                         &self.queue,
                         &self.config,
-                        &self.flow_field,
                         &self.transform_buffer,
+                        &self.flow_field,
                         &self.bg,
                         self.playback.current_frame,
                     );
@@ -537,26 +547,11 @@ impl State {
                     true
                 }
                 KeyCode::KeyL if key_state.is_pressed() && self.keyboard.shift_down() => {
-                    self.line.origins.clear();
-                    let num = 4 * flow::Y_CELLS;
-                    self.line.origins.extend((0..num).map(|i| flow::Pos2 {
-                        x: 0.0,
-                        y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
-                    }));
-                    self.line.invalidated = true;
+                    spawn_lines2(&mut self.line);
                     true
                 }
                 KeyCode::KeyL if key_state.is_pressed() => {
-                    self.line.origins.clear();
-                    let num = 4 * flow::Y_CELLS;
-                    let new_origins = (0..num).map(|i| {
-                        let i = 2.0 * (i as f32 / (num - 1) as f32) - 1.0;
-                        let y = i.signum() * i.abs().powf(1.5);
-                        let pos = Vector2::new(-1.0, 0.125 * y);
-                        normalized_to_flow_pos(pos).unwrap()
-                    });
-                    self.line.origins.extend(new_origins);
-                    self.line.invalidated = true;
+                    spawn_lines1(&mut self.line);
                     true
                 }
                 KeyCode::Delete if key_state.is_pressed() => {
@@ -676,6 +671,7 @@ impl State {
             playback.last_frame_uploaded = now;
             playback.uploaded_frame = playback.current_frame;
             line.invalidated = true;
+            arrow.invalidated = true;
             log::debug!("frame_delta = {actual_delta:?}");
         }
         if bg.current_color_map != bg.uploaded_color_map {
@@ -687,6 +683,7 @@ impl State {
             bg.uploaded_color_map = bg.current_color_map;
         }
 
+        // line
         if line.current_color_map != line.uploaded_color_map {
             write_color_map_to_texture(
                 &self.queue,
@@ -696,6 +693,34 @@ impl State {
             line.uploaded_color_map = line.current_color_map;
         }
         if line.visible && line.invalidated {
+            let pl = &mut self.line_pipeline;
+            compute_lines(
+                &mut pl.vertices,
+                &mut pl.indices,
+                line,
+                &self.flow_field,
+                playback.current_frame,
+                self.mouse.pos,
+            );
+            log::debug!("line vertices = {}", pl.vertices.len());
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.vertex_buffer,
+                &pl.vertices,
+                wgpu::BufferUsages::VERTEX,
+            );
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.index_buffer,
+                &pl.indices,
+                wgpu::BufferUsages::INDEX,
+            );
+        }
+
+        // arrow
+        if arrow.visible && arrow.invalidated {
             let pl = &mut self.line_pipeline;
             pl.vertices.clear();
             pl.indices.clear();
@@ -893,8 +918,8 @@ fn create_bg_pipeline(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
-    flow_field: &flow::Field,
     transform_buffer: &wgpu::Buffer,
+    flow_field: &flow::Field,
     bg: &BgState,
     current_frame: usize,
 ) -> BgPipeline {
@@ -1167,7 +1192,21 @@ fn create_line_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
+    flow_field: &flow::Field,
+    line: &LineState,
+    current_frame: usize,
 ) -> FieldLinePipeline {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    compute_lines(
+        &mut vertices,
+        &mut indices,
+        line,
+        flow_field,
+        current_frame,
+        None,
+    );
+
     let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("line_color_map_texture"),
         size: COLOR_MAP_TEXTURE_SIZE,
@@ -1179,7 +1218,11 @@ fn create_line_pipeline(
         view_formats: &[],
     });
 
-    write_color_map_to_texture(queue, &color_map_texture, &color_map::INFERNO);
+    write_color_map_to_texture(
+        queue,
+        &color_map_texture,
+        LINE_COLOR_MAPS[line.current_color_map],
+    );
     let color_map_texture_view =
         color_map_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let color_map_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1290,10 +1333,6 @@ fn create_line_pipeline(
         },
         multiview: None,
     });
-
-    #[rustfmt::skip]
-    let vertices = Vec::new();
-    let indices = Vec::new();
 
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("line_vertex_buffer"),
@@ -1489,6 +1528,49 @@ fn update_buffer<T: bytemuck::NoUninit>(
         });
     } else {
         queue.write_buffer(buffer, 0, raw);
+    }
+}
+
+fn spawn_lines1(line: &mut LineState) {
+    line.origins.clear();
+    let num = 4 * flow::Y_CELLS;
+    line.origins.extend((0..num).map(|i| flow::Pos2 {
+        x: 0.0,
+        y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
+    }));
+    line.invalidated = true;
+}
+
+fn spawn_lines2(line: &mut LineState) {
+    line.origins.clear();
+    let num = 4 * flow::Y_CELLS;
+    let new_origins = (0..num).map(|i| {
+        let i = 2.0 * (i as f32 / (num - 1) as f32) - 1.0;
+        let y = i.signum() * i.abs().powf(1.5);
+        let pos = Vector2::new(-1.0, 0.125 * y);
+        normalized_to_flow_pos(pos).unwrap()
+    });
+    line.origins.extend(new_origins);
+    line.invalidated = true;
+}
+
+fn compute_lines(
+    vertices: &mut Vec<ScalarVertex>,
+    indices: &mut Vec<[u32; 2]>,
+    line: &LineState,
+    flow_field: &flow::Field,
+    current_frame: usize,
+    mouse_pos: Option<Vector2<f32>>,
+) {
+    vertices.clear();
+    indices.clear();
+    for p in line.origins.iter() {
+        compute_stream_line(vertices, indices, &flow_field, current_frame, *p);
+    }
+    if line.interactive {
+        if let Some(flow_pos) = mouse_pos.and_then(normalized_to_flow_pos) {
+            compute_stream_line(vertices, indices, &flow_field, current_frame, flow_pos);
+        }
     }
 }
 
