@@ -105,6 +105,7 @@ struct State {
     bg_pipeline: BgPipeline,
     line_pipeline: FieldLinePipeline,
     arrow_pipeline: ArrowPipeline,
+    text_pipeline: TextPipeline,
 
     mouse: Mouse,
     keyboard: Keyboard,
@@ -175,6 +176,15 @@ impl LineMethod {
             Euler => Rk2,
             Rk2 => Rk4,
             Rk4 => Euler,
+        }
+    }
+
+    fn cycle_rev(&mut self) {
+        use LineMethod::*;
+        *self = match self {
+            Euler => Rk4,
+            Rk2 => Euler,
+            Rk4 => Rk2,
         }
     }
 }
@@ -347,8 +357,7 @@ impl State {
             .formats
             .iter()
             .copied()
-            .filter(|f| f.is_srgb())
-            .next()
+            .find(|f| f.is_srgb())
             .unwrap_or_else(|| {
                 dbg!("oh no, anyway...");
                 surface_caps.formats[0]
@@ -442,6 +451,41 @@ impl State {
             playback.current_frame,
         );
 
+        let mut text_pipeline = {
+            let mut font_system = glyphon::FontSystem::new();
+            let cache = glyphon::SwashCache::new();
+            let mut atlas = glyphon::TextAtlas::new(&device, &queue, surface_format);
+            let renderer = glyphon::TextRenderer::new(
+                &mut atlas,
+                &device,
+                wgpu::MultisampleState::default(),
+                None,
+            );
+            let buffer = glyphon::Buffer::new(
+                &mut font_system,
+                glyphon::Metrics {
+                    font_size: 13.0,
+                    line_height: 16.0,
+                },
+            );
+            TextPipeline {
+                font_system,
+                cache,
+                atlas,
+                renderer,
+                buffer,
+            }
+        };
+        update_text(
+            &config,
+            &mut text_pipeline,
+            &transform,
+            &playback,
+            &bg,
+            &line,
+            &arrow,
+        );
+
         Self {
             window,
             surface,
@@ -453,6 +497,7 @@ impl State {
             bg_pipeline,
             line_pipeline,
             arrow_pipeline,
+            text_pipeline,
 
             mouse: Mouse::default(),
             keyboard: Keyboard::default(),
@@ -589,8 +634,12 @@ impl State {
                     self.line.invalidated = true;
                     true
                 }
+                KeyCode::KeyM if key_state.is_pressed() && self.keyboard.shift_down() => {
+                    self.line.method.cycle_rev();
+                    self.line.invalidated = true;
+                    true
+                }
                 KeyCode::KeyM if key_state.is_pressed() => {
-                    // TODO: HUD
                     self.line.method.cycle();
                     self.line.invalidated = true;
                     true
@@ -613,12 +662,12 @@ impl State {
 
                 // arrow
                 KeyCode::BracketLeft if key_state.is_pressed() => {
-                    self.arrow.step_size *= 2.0;
+                    self.arrow.step_size = (self.arrow.step_size * 2.0).clamp(0.25, 32.0);
                     self.arrow.invalidated = true;
                     true
                 }
                 KeyCode::BracketRight if key_state.is_pressed() => {
-                    self.arrow.step_size *= 0.5;
+                    self.arrow.step_size = (self.arrow.step_size * 0.5).clamp(0.25, 32.0);
                     self.arrow.invalidated = true;
                     true
                 }
@@ -858,6 +907,16 @@ impl State {
                 wgpu::BufferUsages::INDEX,
             );
         }
+
+        update_text(
+            &self.config,
+            &mut self.text_pipeline,
+            &self.transform,
+            &self.playback,
+            &self.bg,
+            &self.line,
+            &self.arrow,
+        );
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -872,6 +931,34 @@ impl State {
             });
 
         {
+            self.text_pipeline
+                .renderer
+                .prepare(
+                    &self.device,
+                    &self.queue,
+                    &mut self.text_pipeline.font_system,
+                    &mut self.text_pipeline.atlas,
+                    glyphon::Resolution {
+                        width: self.config.width,
+                        height: self.config.height,
+                    },
+                    [glyphon::TextArea {
+                        buffer: &self.text_pipeline.buffer,
+                        left: 0.0,
+                        top: 0.0,
+                        scale: 1.0,
+                        bounds: glyphon::TextBounds {
+                            left: 0,
+                            top: 0,
+                            right: self.config.width as i32,
+                            bottom: self.config.height as i32,
+                        },
+                        default_color: glyphon::Color::rgb(0xFF, 0x40, 0x80),
+                    }],
+                    &mut self.text_pipeline.cache,
+                )
+                .unwrap();
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -879,9 +966,9 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.1,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -918,6 +1005,11 @@ impl State {
                 render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..3 * pl.indices.len() as u32, 0, 0..1);
             }
+
+            self.text_pipeline
+                .renderer
+                .render(&self.text_pipeline.atlas, &mut render_pass)
+                .unwrap();
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -957,6 +1049,14 @@ struct ArrowPipeline {
     color_map_texture: wgpu::Texture,
     step_size_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+}
+
+struct TextPipeline {
+    font_system: glyphon::FontSystem,
+    cache: glyphon::SwashCache,
+    atlas: glyphon::TextAtlas,
+    renderer: glyphon::TextRenderer,
+    buffer: glyphon::Buffer,
 }
 
 #[repr(C)]
@@ -1241,11 +1341,7 @@ fn create_bg_pipeline(
             conservative: false,
         },
         depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
+        multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
 
@@ -1474,11 +1570,7 @@ fn create_line_pipeline(
             conservative: false,
         },
         depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
+        multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
 
@@ -1675,11 +1767,7 @@ fn create_arrow_pipeline(
             conservative: false,
         },
         depth_stencil: None,
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
+        multisample: wgpu::MultisampleState::default(),
         multiview: None,
     });
 
@@ -1704,6 +1792,77 @@ fn create_arrow_pipeline(
         step_size_buffer,
         bind_group,
     }
+}
+
+fn update_text(
+    config: &wgpu::SurfaceConfiguration,
+    pl: &mut TextPipeline,
+    transform: &Transform,
+    playback: &PlaybackState,
+    bg: &BgState,
+    line: &LineState,
+    arrow: &ArrowState,
+) {
+    use std::fmt::Write as _;
+
+    fn on_off_str(val: bool) -> &'static str {
+        match val {
+            true => "on",
+            false => "off",
+        }
+    }
+    fn write_or_pad(str: &mut String, display: bool, args: std::fmt::Arguments) {
+        let start = str.len();
+        str.write_fmt(args).ok();
+        if !display {
+            // SAFETY: we know the start boundary is valid, so we can safely fill the remainder
+            // with spaces
+            let bytes = unsafe { str[start..].as_bytes_mut() };
+            bytes.fill(b' ');
+        }
+    }
+
+    let zoom = transform.zoom;
+    let frame = playback.current_frame;
+    let mut text = format!("frame = {frame:4}  zoom = {zoom:.2}x");
+
+    let bg_on = on_off_str(bg.visible);
+    let filter = bg.filter;
+    write!(&mut text, " | bg = {bg_on:3}").ok();
+    #[rustfmt::skip]
+    write_or_pad(&mut text, bg.visible, format_args!("  filter bg = {filter:5}"));
+
+    let line_on = on_off_str(line.visible);
+    let method = match line.method {
+        LineMethod::Euler => "Euler",
+        LineMethod::Rk2 => "RK2",
+        LineMethod::Rk4 => "RK4",
+    };
+    let interactive = line.interactive;
+    write!(&mut text, " | stream lines = {line_on:3}").ok();
+    #[rustfmt::skip]
+    write_or_pad(&mut text, line.visible, format_args!("  line method = {method:5}"));
+    #[rustfmt::skip]
+    write_or_pad(&mut text, line.visible, format_args!("  interactive line = {interactive:5}"));
+
+    let arrow_on = on_off_str(arrow.visible);
+    let arrow_step_size = arrow.step_size;
+    write!(&mut text, " | arrows = {arrow_on:3}").ok();
+    #[rustfmt::skip]
+    write_or_pad(&mut text, arrow.visible, format_args!("  arrow step size = {arrow_step_size:.2}"));
+
+    pl.buffer.set_size(
+        &mut pl.font_system,
+        config.width as f32,
+        config.height as f32,
+    );
+    pl.buffer.set_text(
+        &mut pl.font_system,
+        &text,
+        glyphon::Attrs::new().family(glyphon::Family::Monospace),
+        glyphon::Shaping::Advanced,
+    );
+    pl.buffer.shape_until_scroll(&mut pl.font_system);
 }
 
 /// Either reuse the buffer if there is enough space, or destroy it and create a new one.
