@@ -7,10 +7,6 @@ impl ColorMap {
     pub const fn as_slice(&self) -> &[[u8; 4]] {
         &self.0
     }
-
-    pub const fn new(colors: [[u8; 4]; SIZE]) -> Self {
-        Self(colors)
-    }
 }
 
 pub const RED: ColorMap = ColorMap([[255, 0, 0, 255]; SIZE]);

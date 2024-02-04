@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
-use cgmath::{Matrix4, SquareMatrix, Vector2, Vector4};
+use cgmath::{Matrix3, SquareMatrix, Vector2, Vector3};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, KeyEvent, MouseButton, WindowEvent};
@@ -180,6 +180,7 @@ impl LineMethod {
 
 struct ArrowState {
     visible: bool,
+    step_size: f32,
     invalidated: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
@@ -252,7 +253,7 @@ impl Transform {
 }
 
 impl Transform {
-    fn build_matrix(&self, aspect: f32) -> Matrix4<f32> {
+    fn build_matrix(&self, aspect: f32) -> Matrix3<f32> {
         let Self {
             offset,
             zoom,
@@ -260,32 +261,28 @@ impl Transform {
         } = *self;
 
         #[rustfmt::skip]
-        let offset_mat = Matrix4::new(
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            offset.x, offset.y, 0.0, 1.0,
+        let offset_mat = Matrix3::new(
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            offset.x, offset.y, 1.0,
         );
         #[rustfmt::skip]
-        let zoom_mat = Matrix4::new(
-            zoom, 0.0, 0.0, 0.0,
-            0.0, zoom, 0.0, 0.0,
-            0.0, 0.0, zoom, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+        let zoom_mat = Matrix3::new(
+            zoom, 0.0, 0.0,
+            0.0, zoom, 0.0,
+            0.0, 0.0, 1.0,
         );
         #[rustfmt::skip]
-        let rot_mat = Matrix4::new(
-            rotation.cos(), rotation.sin(), 0.0, 0.0,
-            -rotation.sin(), rotation.cos(), 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+        let rot_mat = Matrix3::new(
+            rotation.cos(), rotation.sin(), 0.0,
+            -rotation.sin(), rotation.cos(), 0.0,
+            0.0, 0.0, 1.0,
         );
         #[rustfmt::skip]
-        let aspect_mat = Matrix4::new(
-            1.0, 0.0, 0.0, 0.0,
-            0.0, aspect,  0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+        let aspect_mat = Matrix3::new(
+            1.0, 0.0, 0.0,
+            0.0, aspect,  0.0,
+            0.0, 0.0, 1.0,
         );
 
         zoom_mat * offset_mat * aspect_mat * rot_mat
@@ -294,12 +291,16 @@ impl Transform {
 
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct TranformUniform([[f32; 4]; 4]);
+struct TransformUniform([[f32; 4]; 3]);
 
-impl From<Matrix4<f32>> for TranformUniform {
-    fn from(value: Matrix4<f32>) -> Self {
-        // SAFETY: Matrix4<f32> is layed out the same
-        unsafe { std::mem::transmute(value) }
+impl From<Matrix3<f32>> for TransformUniform {
+    fn from(mat: Matrix3<f32>) -> Self {
+        // each column of the `matrix3x3<f32>` has an alignment of 16 bytes
+        Self([
+            [mat.x.x, mat.x.y, mat.x.z, 0.0],
+            [mat.y.x, mat.y.y, mat.y.z, 0.0],
+            [mat.z.x, mat.z.y, mat.z.z, 0.0],
+        ])
     }
 }
 
@@ -365,7 +366,7 @@ impl State {
 
         let transform = Transform::default();
         let aspect = config.width as f32 / config.height as f32;
-        let transform_uniform: TranformUniform = transform.build_matrix(aspect).into();
+        let transform_uniform: TransformUniform = transform.build_matrix(aspect).into();
         let transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("transform_buffer"),
             contents: bytemuck::cast_slice(&[transform_uniform]),
@@ -419,11 +420,20 @@ impl State {
 
         let arrow = ArrowState {
             visible: false,
+            step_size: 1.0,
             invalidated: false,
             current_color_map: 0,
             uploaded_color_map: 0,
         };
-        let arrow_pipeline = create_arrow_pipeline(&device, &queue, &config, &transform_buffer);
+        let arrow_pipeline = create_arrow_pipeline(
+            &device,
+            &queue,
+            &config,
+            &transform_buffer,
+            &flow_field,
+            &arrow,
+            playback.current_frame,
+        );
 
         Self {
             window,
@@ -520,6 +530,7 @@ impl State {
                     true
                 }
 
+                // visibility and color-maps
                 KeyCode::Digit1 if key_state.is_pressed() && self.keyboard.ctrl_down() => {
                     self.bg.current_color_map =
                         (self.bg.current_color_map + 1) % BG_COLOR_MAPS.len();
@@ -570,6 +581,7 @@ impl State {
                     true
                 }
                 KeyCode::KeyM if key_state.is_pressed() => {
+                    // TODO: HUD
                     self.line.method.cycle();
                     self.line.invalidated = true;
                     true
@@ -587,32 +599,42 @@ impl State {
                     self.line.invalidated = true;
                     true
                 }
+
+                // arrow
+                KeyCode::BracketLeft if key_state.is_pressed() => {
+                    self.arrow.step_size *= 2.0;
+                    self.arrow.invalidated = true;
+                    true
+                }
+                KeyCode::BracketRight if key_state.is_pressed() => {
+                    self.arrow.step_size *= 0.5;
+                    self.arrow.invalidated = true;
+                    true
+                }
                 _ => false,
             },
             WindowEvent::CursorMoved { position, .. } => {
                 // TODO: maybe highlight hovered lines?
                 let aspect = self.config.width as f32 / self.config.height as f32;
                 let transform_mat = self.transform.build_matrix(aspect);
-                let homogeneous = Vector4::new(
+                let homogeneous = Vector3::new(
                     2.0 * (position.x as f32 / (self.size.width - 1) as f32) - 1.0,
                     // flip y pos
                     -2.0 * (position.y as f32 / (self.size.height - 1) as f32) + 1.0,
-                    0.0,
                     1.0,
                 );
                 let inverse_mat = transform_mat.invert().expect("should always be invertable");
                 let new_pos = inverse_mat * homogeneous;
                 let new_pos = Vector2::new(new_pos.x, new_pos.y);
 
-                let in_bounds =
-                    (-1.0..=1.0).contains(&new_pos.x) && (-1.0..=1.0).contains(&new_pos.y);
-                if self.mouse.middle_down {
-                    if let Some(old_pos) = self.mouse.pos {
+                match self.mouse.pos {
+                    Some(old_pos) if self.mouse.middle_down => {
                         let delta = new_pos - old_pos;
                         self.transform.pan_by(delta);
                     }
-                } else {
-                    self.mouse.pos = in_bounds.then_some(new_pos);
+                    _ => {
+                        self.mouse.pos = Some(new_pos);
+                    }
                 }
                 self.line.invalidated = true;
 
@@ -679,7 +701,7 @@ impl State {
         let arrow = &mut self.arrow;
 
         let aspect = self.config.width as f32 / self.config.height as f32;
-        let transform_uniform: TranformUniform = self.transform.build_matrix(aspect).into();
+        let transform_uniform: TransformUniform = self.transform.build_matrix(aspect).into();
         self.queue.write_buffer(
             &self.transform_buffer,
             0,
@@ -753,8 +775,43 @@ impl State {
         }
 
         // arrow
+        if arrow.current_color_map != arrow.uploaded_color_map {
+            write_color_map_to_texture(
+                &self.queue,
+                &self.arrow_pipeline.color_map_texture,
+                ARROW_COLOR_MAPS[arrow.current_color_map],
+            );
+            arrow.uploaded_color_map = arrow.current_color_map;
+        }
         if arrow.visible && arrow.invalidated {
-            // TODO
+            let pl = &mut self.arrow_pipeline;
+            self.queue.write_buffer(
+                &pl.step_size_buffer,
+                0,
+                bytemuck::cast_slice(&[arrow.step_size]),
+            );
+            update_arrows(
+                &mut pl.vertices,
+                &mut pl.indices,
+                &self.flow_field,
+                playback.current_frame,
+                arrow.step_size,
+            );
+            log::debug!("arrow vertices = {}", pl.vertices.len());
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.vertex_buffer,
+                &pl.vertices,
+                wgpu::BufferUsages::VERTEX,
+            );
+            update_buffer(
+                &self.device,
+                &self.queue,
+                &mut pl.index_buffer,
+                &pl.indices,
+                wgpu::BufferUsages::INDEX,
+            );
         }
     }
 
@@ -791,30 +848,30 @@ impl State {
             });
 
             if self.bg.visible {
-                let p = &self.bg_pipeline;
-                render_pass.set_pipeline(&p.render_pipeline);
-                render_pass.set_bind_group(0, &p.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-                render_pass.draw_indexed(0..p.num_indices, 0, 0..1);
+                let pl = &self.bg_pipeline;
+                render_pass.set_pipeline(&pl.render_pipeline);
+                render_pass.set_bind_group(0, &pl.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                render_pass.draw_indexed(0..pl.num_indices, 0, 0..1);
             }
 
             if self.line.visible {
-                let p = &self.line_pipeline;
-                render_pass.set_pipeline(&p.render_pipeline);
-                render_pass.set_bind_group(0, &p.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..2 * p.indices.len() as u32, 0, 0..1);
+                let pl = &self.line_pipeline;
+                render_pass.set_pipeline(&pl.render_pipeline);
+                render_pass.set_bind_group(0, &pl.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..2 * pl.indices.len() as u32, 0, 0..1);
             }
 
             if self.arrow.visible {
-                let p = &self.arrow_pipeline;
-                render_pass.set_pipeline(&p.render_pipeline);
-                render_pass.set_bind_group(0, &p.bind_group, &[]);
-                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..3 * p.indices.len() as u32, 0, 0..1);
+                let pl = &self.arrow_pipeline;
+                render_pass.set_pipeline(&pl.render_pipeline);
+                render_pass.set_bind_group(0, &pl.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, pl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(pl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..3 * pl.indices.len() as u32, 0, 0..1);
             }
         }
 
@@ -847,17 +904,19 @@ struct FieldLinePipeline {
 
 struct ArrowPipeline {
     render_pipeline: wgpu::RenderPipeline,
-    vertices: Vec<ScalarVertex>,
+    vertices: Vec<ArrowVertex>,
     indices: Vec<[u32; 3]>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
+    color_map_texture: wgpu::Texture,
+    step_size_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct ScalarVertex {
-    position: [f32; 3],
+    position: [f32; 2],
     scalar: f32,
 }
 
@@ -870,10 +929,10 @@ impl ScalarVertex {
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32,
                 },
@@ -884,8 +943,36 @@ impl ScalarVertex {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct ArrowVertex {
+    position: [f32; 2],
+    velocity: [f32; 2],
+}
+
+impl ArrowVertex {
+    fn desc() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<ArrowVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+            ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct TextureVertex {
-    position: [f32; 3],
+    position: [f32; 2],
     tex_coords: [f32; 2],
 }
 
@@ -898,10 +985,10 @@ impl TextureVertex {
                 wgpu::VertexAttribute {
                     offset: 0,
                     shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
+                    format: wgpu::VertexFormat::Float32x2,
                 },
                 wgpu::VertexAttribute {
-                    offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
+                    offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x2,
                 },
@@ -1108,10 +1195,10 @@ fn create_bg_pipeline(
 
     #[rustfmt::skip]
     const BG_VERTICES: &[TextureVertex] = &[
-        TextureVertex { position: [-1.0, -0.125, 0.0], tex_coords: [0.0, 1.0] },
-        TextureVertex { position: [ 1.0, -0.125, 0.0], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [ 1.0,  0.125, 0.0], tex_coords: [1.0, 0.0] },
-        TextureVertex { position: [-1.0,  0.125, 0.0], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [-1.0, -0.125], tex_coords: [0.0, 1.0] },
+        TextureVertex { position: [ 1.0, -0.125], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [ 1.0,  0.125], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [-1.0,  0.125], tex_coords: [0.0, 0.0] },
     ];
     #[rustfmt::skip]
     const BG_INDICES: &[u16] = &[
@@ -1285,7 +1372,7 @@ fn create_line_pipeline(
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("line_shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("color_shader.wgsl"))),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("line_shader.wgsl"))),
     });
     let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("render_pipline_layout_2"),
@@ -1357,7 +1444,20 @@ fn create_arrow_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
+    flow_field: &flow::Field,
+    arrow: &ArrowState,
+    current_frame: usize,
 ) -> ArrowPipeline {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    update_arrows(
+        &mut vertices,
+        &mut indices,
+        flow_field,
+        current_frame,
+        arrow.step_size,
+    );
+
     let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("arrow_color_map_texture"),
         size: COLOR_MAP_TEXTURE_SIZE,
@@ -1380,6 +1480,19 @@ fn create_arrow_pipeline(
         min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::FilterMode::Nearest,
         ..Default::default()
+    });
+
+    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("max_velocity_buffer"),
+        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::UNIFORM,
+    });
+    let step_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("arrow_step_size_buffer"),
+        contents: bytemuck::cast_slice(&[arrow.step_size]),
+        usage: wgpu::BufferUsages::VERTEX
+            | wgpu::BufferUsages::UNIFORM
+            | wgpu::BufferUsages::COPY_DST,
     });
 
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1412,6 +1525,26 @@ fn create_arrow_pipeline(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 10,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1431,26 +1564,34 @@ fn create_arrow_pipeline(
                 binding: 8,
                 resource: transform_buffer.as_entire_binding(),
             },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: max_velocity_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: step_size_buffer.as_entire_binding(),
+            },
         ],
     });
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("line_shader"),
-        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("color_shader.wgsl"))),
+        label: Some("arrow_shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("arrow_shader.wgsl"))),
     });
     let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("render_pipline_layout_2"),
+        label: Some("arrow_render_pipline_layout"),
         bind_group_layouts: &[&bind_group_layout],
         push_constant_ranges: &[],
     });
 
     let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("line_render_pipeline"),
+        label: Some("arrow_line_render_pipeline"),
         layout: Some(&render_pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: "vs_main",
-            buffers: &[ScalarVertex::desc()],
+            buffers: &[ArrowVertex::desc()],
         },
         fragment: Some(wgpu::FragmentState {
             module: &shader,
@@ -1481,10 +1622,6 @@ fn create_arrow_pipeline(
         multiview: None,
     });
 
-    #[rustfmt::skip]
-    let vertices = Vec::new();
-    let indices = Vec::new();
-
     let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("arrow_vertex_buffer"),
         contents: bytemuck::cast_slice(&vertices),
@@ -1502,6 +1639,8 @@ fn create_arrow_pipeline(
         indices,
         vertex_buffer,
         index_buffer,
+        color_map_texture,
+        step_size_buffer,
         bind_group,
     }
 }
@@ -1592,19 +1731,11 @@ fn compute_stream_line(
     start_pos: flow::Pos2,
     method: LineMethod,
 ) {
-    fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 3] {
-        [
-            2.0 * (pos.x / (flow::X_CELLS - 1) as f32) - 1.0,
-            0.25 * (pos.y / (flow::Y_CELLS - 1) as f32) - 0.125,
-            0.0,
-        ]
-    }
-
     let frame = flow_field.frame(current_frame);
     let first_index = vertices.len();
     let mut empty = true;
     let mut pos = start_pos;
-    let mut v0 = bilinear_lookup(&frame, pos);
+    let mut v0 = bilinear_lookup(frame, pos);
 
     const MIN_VELOCITY: f32 = 0.01;
     const MAX_NUM_STEPS: usize = 10_000;
@@ -1621,7 +1752,7 @@ fn compute_stream_line(
                 if !flow::in_bounds(p1) {
                     break;
                 }
-                let k2 = bilinear_lookup(&frame, p1) * STEP_SIZE;
+                let k2 = bilinear_lookup(frame, p1) * STEP_SIZE;
                 pos += (k1 + k2) * 0.5;
             }
             LineMethod::Rk4 => {
@@ -1629,17 +1760,17 @@ fn compute_stream_line(
                 if !flow::in_bounds(p1) {
                     break;
                 }
-                let k2 = bilinear_lookup(&frame, p1) * STEP_SIZE;
+                let k2 = bilinear_lookup(frame, p1) * STEP_SIZE;
                 let p2 = pos + k2 * 0.5;
                 if !flow::in_bounds(p2) {
                     break;
                 }
-                let k3 = bilinear_lookup(&frame, p2) * STEP_SIZE;
+                let k3 = bilinear_lookup(frame, p2) * STEP_SIZE;
                 let p3 = pos + k3;
                 if !flow::in_bounds(p3) {
                     break;
                 }
-                let k4 = bilinear_lookup(&frame, p3) * STEP_SIZE;
+                let k4 = bilinear_lookup(frame, p3) * STEP_SIZE;
                 let p4 = pos + k4;
                 if !flow::in_bounds(p4) {
                     break;
@@ -1652,7 +1783,7 @@ fn compute_stream_line(
             break;
         }
 
-        let v1 = bilinear_lookup(&frame, pos);
+        let v1 = bilinear_lookup(frame, pos);
 
         if empty {
             vertices.push(ScalarVertex {
@@ -1681,7 +1812,44 @@ fn compute_stream_line(
     }
 }
 
-fn bilinear_lookup(frame: &flow::Frame, pos: flow::Pos2) -> flow::Vec2 {
+fn update_arrows(
+    vertices: &mut Vec<ArrowVertex>,
+    indices: &mut Vec<[u32; 3]>,
+    flow_field: &flow::Field,
+    current_frame: usize,
+    arrow_step: f32,
+) {
+    vertices.clear();
+    indices.clear();
+
+    let frame = flow_field.frame(current_frame);
+    let num_x_arrows = (flow::X_CELLS as f32 - 1.0) / arrow_step;
+    let num_y_arrows = (flow::Y_CELLS as f32 - 1.0) / arrow_step;
+
+    for y in 0..num_y_arrows.floor() as u32 {
+        for x in 0..num_x_arrows.floor() as u32 {
+            let flow_pos = flow::Pos2 {
+                x: arrow_step as f32 * x as f32 + 0.5 * (1.0 + num_x_arrows.fract()) * arrow_step,
+                y: arrow_step as f32 * y as f32 + 0.5 * (1.0 + num_y_arrows.fract()) * arrow_step,
+            };
+            let velocity = bilinear_lookup(frame, flow_pos);
+            let vertex = ArrowVertex {
+                position: flow_pos_to_wgpu_coord(flow_pos),
+                velocity: [velocity.x, velocity.y],
+            };
+
+            let i = vertices.len() as u32;
+            vertices.extend([vertex; 7]);
+            indices.extend([
+                [i + 0, i + 1, i + 2],
+                [i + 3, i + 5, i + 4],
+                [i + 4, i + 5, i + 6],
+            ]);
+        }
+    }
+}
+
+fn bilinear_lookup(frame: flow::Frame, pos: flow::Pos2) -> flow::Vec2 {
     let aa = frame.get(pos.x.floor() as usize, pos.y.floor() as usize);
     let ab = frame.get(pos.x.floor() as usize, pos.y.ceil() as usize);
     let ba = frame.get(pos.x.ceil() as usize, pos.y.floor() as usize);
@@ -1705,4 +1873,11 @@ fn normalized_to_flow_pos(pos: Vector2<f32>) -> Option<flow::Pos2> {
         x: 0.5 * (pos.x + 1.0) * (flow::X_CELLS - 1) as f32,
         y: 4.0 * (pos.y + 0.125) * (flow::Y_CELLS - 1) as f32,
     })
+}
+
+fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 2] {
+    [
+        2.0 * (pos.x / (flow::X_CELLS - 1) as f32) - 1.0,
+        0.25 * (pos.y / (flow::Y_CELLS - 1) as f32) - 0.125,
+    ]
 }
