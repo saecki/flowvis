@@ -1,5 +1,9 @@
 # flowvis
-Visualize a 2D vector field stored in the `flow.raw` file.
+Visualize a 2D vector field from the `flow.raw` file, which needs to be placed in this directory.
+
+## Build and run
+- Install rust (using [rustup](https://rustup.rs/))
+- Run `cargo run --release`
 
 ## Keymappings
 
