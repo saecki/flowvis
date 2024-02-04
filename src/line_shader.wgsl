@@ -1,6 +1,6 @@
 struct VertexInput {
     @location(0) position: vec2<f32>,
-    @location(1) scalar: f32,
+    @location(1) velocity: f32,
 }
 
 struct VertexOutput {
@@ -10,13 +10,15 @@ struct VertexOutput {
 
 @group(0) @binding(8)
 var<uniform> transform: mat3x3<f32>;
+@group(0) @binding(9)
+var<uniform> max_velocity: f32;
 
 @vertex
 fn vs_main(
     in: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.scalar = in.scalar;
+    out.scalar = in.velocity / max_velocity;
     let pos = transform * vec3<f32>(in.position, 1.0);
     out.clip_position = vec4<f32>(pos.xy, 0.0, 1.0);
     return out;

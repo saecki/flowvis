@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
-use cgmath::{Matrix3, SquareMatrix, Vector2, Vector3};
+use cgmath::{InnerSpace, Matrix3, SquareMatrix, Vector2, Vector3};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::event::{Event, KeyEvent, MouseButton, WindowEvent};
@@ -110,6 +110,7 @@ struct State {
     keyboard: Keyboard,
     transform: Transform,
     transform_buffer: wgpu::Buffer,
+    max_velocity_buffer: wgpu::Buffer,
 
     playback: PlaybackState,
     bg: BgState,
@@ -370,9 +371,12 @@ impl State {
         let transform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("transform_buffer"),
             contents: bytemuck::cast_slice(&[transform_uniform]),
-            usage: wgpu::BufferUsages::VERTEX
-                | wgpu::BufferUsages::UNIFORM
-                | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("max_velocity_buffer"),
+            contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
+            usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let playback = PlaybackState {
@@ -393,6 +397,7 @@ impl State {
             &queue,
             &config,
             &transform_buffer,
+            &max_velocity_buffer,
             &flow_field,
             &bg,
             playback.current_frame,
@@ -413,6 +418,7 @@ impl State {
             &queue,
             &config,
             &transform_buffer,
+            &max_velocity_buffer,
             &flow_field,
             &line,
             playback.current_frame,
@@ -420,7 +426,7 @@ impl State {
 
         let arrow = ArrowState {
             visible: false,
-            step_size: 1.0,
+            step_size: 2.0,
             invalidated: false,
             current_color_map: 0,
             uploaded_color_map: 0,
@@ -430,6 +436,7 @@ impl State {
             &queue,
             &config,
             &transform_buffer,
+            &max_velocity_buffer,
             &flow_field,
             &arrow,
             playback.current_frame,
@@ -451,6 +458,7 @@ impl State {
             keyboard: Keyboard::default(),
             transform,
             transform_buffer,
+            max_velocity_buffer,
 
             playback,
             bg,
@@ -567,6 +575,7 @@ impl State {
                         &self.queue,
                         &self.config,
                         &self.transform_buffer,
+                        &self.max_velocity_buffer,
                         &self.flow_field,
                         &self.bg,
                         self.playback.current_frame,
@@ -588,10 +597,12 @@ impl State {
                 }
                 KeyCode::KeyL if key_state.is_pressed() && self.keyboard.shift_down() => {
                     spawn_lines2(&mut self.line);
+                    self.line.invalidated = true;
                     true
                 }
                 KeyCode::KeyL if key_state.is_pressed() => {
                     spawn_lines1(&mut self.line);
+                    self.line.invalidated = true;
                     true
                 }
                 KeyCode::Delete if key_state.is_pressed() => {
@@ -636,7 +647,10 @@ impl State {
                         self.mouse.pos = Some(new_pos);
                     }
                 }
-                self.line.invalidated = true;
+
+                if self.line.interactive {
+                    self.line.invalidated = true;
+                }
 
                 true
             }
@@ -672,15 +686,36 @@ impl State {
                     true
                 }
                 MouseButton::Right if button_state.is_pressed() => {
-                    // TODO: store vertex_buffer indices of line origins, delete lines by clicking
-                    // anywhere on them
-                    if let Some(flow_pos) = self.mouse.pos.and_then(normalized_to_flow_pos) {
-                        let scaled_dist = 1.0 / self.transform.zoom;
-                        let squared_dist = scaled_dist * scaled_dist;
-                        self.line
-                            .origins
-                            .retain(|&o| (o - flow_pos).norm_squared() >= squared_dist);
-                        self.line.invalidated = true;
+                    if let Some(pos) = self.mouse.pos {
+                        let mut closest = None;
+                        for (vi, v) in self.line_pipeline.vertices.iter().enumerate() {
+                            let p: Vector2<f32> = unsafe { std::mem::transmute(v.position) };
+                            let mag = (pos - p).magnitude();
+                            if mag < 0.001 {
+                                match closest {
+                                    Some((other_mag, _)) => {
+                                        if mag < other_mag {
+                                            closest = Some((mag, vi));
+                                        }
+                                    }
+                                    None => {
+                                        closest = Some((mag, vi));
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some((_, vi)) = closest {
+                            let mut oi = self.line_pipeline.first_vertices.len() - 1;
+                            for (i, fi) in self.line_pipeline.first_vertices.iter().enumerate() {
+                                if vi < *fi {
+                                    oi = i - 1;
+                                    break;
+                                }
+                            }
+                            self.line.origins.remove(oi);
+                            self.line.invalidated = true;
+                        }
                     }
                     true
                 }
@@ -720,7 +755,6 @@ impl State {
                     &self.queue,
                     &self.bg_pipeline.velocity_texture,
                     self.flow_field.frame(playback.current_frame),
-                    self.flow_field.max_velocity,
                 );
             }
             playback.last_frame_uploaded = now;
@@ -749,7 +783,9 @@ impl State {
         }
         if line.visible && line.invalidated {
             let pl = &mut self.line_pipeline;
+            let start = Instant::now();
             compute_lines(
+                &mut pl.first_vertices,
                 &mut pl.vertices,
                 &mut pl.indices,
                 line,
@@ -757,7 +793,12 @@ impl State {
                 playback.current_frame,
                 self.mouse.pos,
             );
+            let end = Instant::now();
+            log::debug!("line computation = {:?}", end - start);
+            line.invalidated = false;
+
             log::debug!("line vertices = {}", pl.vertices.len());
+            let start = Instant::now();
             update_buffer(
                 &self.device,
                 &self.queue,
@@ -772,6 +813,8 @@ impl State {
                 &pl.indices,
                 wgpu::BufferUsages::INDEX,
             );
+            let end = Instant::now();
+            log::debug!("upload buffers = {:?}", end - start);
         }
 
         // arrow
@@ -797,6 +840,8 @@ impl State {
                 playback.current_frame,
                 arrow.step_size,
             );
+            arrow.invalidated = false;
+
             log::debug!("arrow vertices = {}", pl.vertices.len());
             update_buffer(
                 &self.device,
@@ -894,6 +939,7 @@ struct BgPipeline {
 
 struct FieldLinePipeline {
     render_pipeline: wgpu::RenderPipeline,
+    first_vertices: Vec<usize>,
     vertices: Vec<ScalarVertex>,
     indices: Vec<[u32; 2]>,
     vertex_buffer: wgpu::Buffer,
@@ -1002,6 +1048,7 @@ fn create_bg_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
+    max_velocity_buffer: &wgpu::Buffer,
     flow_field: &flow::Field,
     bg: &BgState,
     current_frame: usize,
@@ -1016,12 +1063,7 @@ fn create_bg_pipeline(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    write_frame_to_texture(
-        queue,
-        &velocity_texture,
-        flow_field.frame(current_frame),
-        flow_field.max_velocity,
-    );
+    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
     let velocity_texture_view =
         velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1116,6 +1158,16 @@ fn create_bg_pipeline(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1142,6 +1194,10 @@ fn create_bg_pipeline(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: transform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: max_velocity_buffer.as_entire_binding(),
             },
         ],
     });
@@ -1228,17 +1284,9 @@ fn create_bg_pipeline(
     }
 }
 
-fn write_frame_to_texture(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    frame: flow::Frame,
-    max_velocity: f32,
-) {
+fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: flow::Frame) {
     type PixelType = f32;
-    let velocities = frame
-        .iter()
-        .map(|v| v.norm() / max_velocity)
-        .collect::<Vec<PixelType>>();
+    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
 
     let pixel_size = std::mem::size_of::<PixelType>() as u32;
     let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
@@ -1275,13 +1323,16 @@ fn create_line_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
+    max_velocity_buffer: &wgpu::Buffer,
     flow_field: &flow::Field,
     line: &LineState,
     current_frame: usize,
 ) -> FieldLinePipeline {
+    let mut first_vertices = Vec::new();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     compute_lines(
+        &mut first_vertices,
         &mut vertices,
         &mut indices,
         line,
@@ -1348,6 +1399,16 @@ fn create_line_pipeline(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
 
@@ -1366,6 +1427,10 @@ fn create_line_pipeline(
             wgpu::BindGroupEntry {
                 binding: 8,
                 resource: transform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: max_velocity_buffer.as_entire_binding(),
             },
         ],
     });
@@ -1430,6 +1495,7 @@ fn create_line_pipeline(
 
     FieldLinePipeline {
         render_pipeline,
+        first_vertices,
         vertices,
         indices,
         vertex_buffer,
@@ -1444,6 +1510,7 @@ fn create_arrow_pipeline(
     queue: &wgpu::Queue,
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
+    max_velocity_buffer: &wgpu::Buffer,
     flow_field: &flow::Field,
     arrow: &ArrowState,
     current_frame: usize,
@@ -1480,12 +1547,6 @@ fn create_arrow_pipeline(
         min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::FilterMode::Nearest,
         ..Default::default()
-    });
-
-    let max_velocity_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("max_velocity_buffer"),
-        contents: bytemuck::cast_slice(&[flow_field.max_velocity]),
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::UNIFORM,
     });
     let step_size_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("arrow_step_size_buffer"),
@@ -1668,17 +1729,16 @@ fn update_buffer<T: bytemuck::NoUninit>(
 
 fn spawn_lines1(line: &mut LineState) {
     line.origins.clear();
-    let num = 4 * flow::Y_CELLS;
+    let num = 2 * flow::Y_CELLS;
     line.origins.extend((0..num).map(|i| flow::Pos2 {
         x: 0.0,
         y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
     }));
-    line.invalidated = true;
 }
 
 fn spawn_lines2(line: &mut LineState) {
     line.origins.clear();
-    let num = 4 * flow::Y_CELLS;
+    let num = 2 * flow::Y_CELLS;
     let new_origins = (0..num).map(|i| {
         let i = 2.0 * (i as f32 / (num - 1) as f32) - 1.0;
         let y = i.signum() * i.abs().powf(1.5);
@@ -1686,10 +1746,10 @@ fn spawn_lines2(line: &mut LineState) {
         normalized_to_flow_pos(pos).unwrap()
     });
     line.origins.extend(new_origins);
-    line.invalidated = true;
 }
 
 fn compute_lines(
+    first_vertices: &mut Vec<usize>,
     vertices: &mut Vec<ScalarVertex>,
     indices: &mut Vec<[u32; 2]>,
     line: &LineState,
@@ -1697,10 +1757,12 @@ fn compute_lines(
     current_frame: usize,
     mouse_pos: Option<Vector2<f32>>,
 ) {
+    first_vertices.clear();
     vertices.clear();
     indices.clear();
     for p in line.origins.iter() {
         compute_stream_line(
+            first_vertices,
             vertices,
             indices,
             &flow_field,
@@ -1712,6 +1774,7 @@ fn compute_lines(
     if line.interactive {
         if let Some(flow_pos) = mouse_pos.and_then(normalized_to_flow_pos) {
             compute_stream_line(
+                first_vertices,
                 vertices,
                 indices,
                 &flow_field,
@@ -1724,6 +1787,7 @@ fn compute_lines(
 }
 
 fn compute_stream_line(
+    first_vertices: &mut Vec<usize>,
     vertices: &mut Vec<ScalarVertex>,
     indices: &mut Vec<[u32; 2]>,
     flow_field: &flow::Field,
@@ -1732,14 +1796,19 @@ fn compute_stream_line(
     method: LineMethod,
 ) {
     let frame = flow_field.frame(current_frame);
-    let first_index = vertices.len();
-    let mut empty = true;
+    let first_vertex = vertices.len();
     let mut pos = start_pos;
     let mut v0 = bilinear_lookup(frame, pos);
 
     const MIN_VELOCITY: f32 = 0.01;
-    const MAX_NUM_STEPS: usize = 10_000;
+    const MAX_NUM_STEPS: usize = 2_000;
     const STEP_SIZE: f32 = 0.5;
+
+    vertices.push(ScalarVertex {
+        position: flow_pos_to_wgpu_coord(start_pos),
+        scalar: v0.norm(),
+    });
+
     loop {
         // RK4 method
         let k1 = v0 * STEP_SIZE;
@@ -1785,30 +1854,26 @@ fn compute_stream_line(
 
         let v1 = bilinear_lookup(frame, pos);
 
-        if empty {
-            vertices.push(ScalarVertex {
-                position: flow_pos_to_wgpu_coord(start_pos),
-                scalar: v0.norm() / flow_field.max_velocity,
-            });
-            empty = false;
-        }
         vertices.push(ScalarVertex {
             position: flow_pos_to_wgpu_coord(pos),
-            scalar: v1.norm() / flow_field.max_velocity,
+            scalar: v1.norm(),
         });
 
         if v1.norm() < MIN_VELOCITY {
             break;
         }
-        if vertices.len() - first_index > MAX_NUM_STEPS {
+        if vertices.len() - first_vertex > MAX_NUM_STEPS {
             break;
         }
 
         v0 = v1;
     }
 
-    if !empty {
-        indices.extend((first_index..vertices.len() - 1).map(|i| [i as u32, i as u32 + 1]));
+    if first_vertex < vertices.len() {
+        first_vertices.push(first_vertex as usize);
+        indices.extend((first_vertex..vertices.len() - 1).map(|i| [i as u32, i as u32 + 1]));
+    } else {
+        vertices.pop();
     }
 }
 
@@ -1850,10 +1915,10 @@ fn update_arrows(
 }
 
 fn bilinear_lookup(frame: flow::Frame, pos: flow::Pos2) -> flow::Vec2 {
-    let aa = frame.get(pos.x.floor() as usize, pos.y.floor() as usize);
-    let ab = frame.get(pos.x.floor() as usize, pos.y.ceil() as usize);
-    let ba = frame.get(pos.x.ceil() as usize, pos.y.floor() as usize);
-    let bb = frame.get(pos.x.ceil() as usize, pos.y.ceil() as usize);
+    let aa = frame.get(pos.x as u32, pos.y as u32);
+    let ab = frame.get(pos.x as u32, pos.y.ceil() as u32);
+    let ba = frame.get(pos.x.ceil() as u32, pos.y as u32);
+    let bb = frame.get(pos.x.ceil() as u32, pos.y.ceil() as u32);
 
     let u_x = pos.x.fract();
     let u_y = pos.y.fract();

@@ -52,10 +52,12 @@ impl Field {
 pub struct Frame<'a>(&'a [Vec2]);
 
 impl<'a> Frame<'a> {
-    pub fn get(&self, x: usize, y: usize) -> Vec2 {
-        debug_assert!(x < X_CELLS);
-        debug_assert!(y < Y_CELLS);
-        self.0[y * X_CELLS + x]
+    pub fn get(&self, x: u32, y: u32) -> Vec2 {
+        debug_assert!(x < X_CELLS as u32);
+        debug_assert!(y < Y_CELLS as u32);
+        unsafe {
+            *self.0.get_unchecked((y * X_CELLS as u32 + x) as usize)
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Vec2> {
@@ -75,10 +77,6 @@ impl Vec2 {
 
     pub fn norm(&self) -> f32 {
         (self.x * self.x + self.y * self.y).sqrt()
-    }
-
-    pub fn norm_squared(&self) -> f32 {
-        self.x * self.x + self.y * self.y
     }
 }
 
