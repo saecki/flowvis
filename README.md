@@ -39,8 +39,8 @@ Visualize a 2D vector field from the `flow.raw` file, which needs to be placed i
 
 | Key                              | Action                   |
 |----------------------------------|--------------------------|
-| <kbd>ctrl left-click</kbd>       | Add a stream line origin |
-| <kbd>ctrl right-click</kbd>      | Remove a stream line     |
+| <kbd>left-click</kbd>            | Add a stream line origin |
+| <kbd>right-click</kbd>           | Remove a stream line     |
 | <kbd>ctrl scroll</kbd>           | Zoom                     |
 | <kbd>scroll</kbd>                | Pan                      |
 | <kbd>shift scroll</kbd>          | Pan in x-direction       |
