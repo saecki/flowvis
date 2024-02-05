@@ -16,6 +16,8 @@ Visualize a 2D vector field from the `flow.raw` file, which needs to be placed i
 | <kbd>space</kbd>          | Play/pause video playback                                                |
 | <kbd>.</kbd>              | Step to next frame                                                       |
 | <kbd>,</kbd>              | Step to previous frame                                                   |
+| <kbd>[</kbd>              | Slow down playback                                                       |
+| <kbd>]</kbd>              | Speed up playback                                                        |
 |                           |                                                                          |
 | <kbd>1</kbd>              | Show/hide the background velocity texture                                |
 | <kbd>ctrl 1</kbd>         | Cycle through the color map for the background texture                   |
@@ -32,8 +34,8 @@ Visualize a 2D vector field from the `flow.raw` file, which needs to be placed i
 |                           |                                                                          |
 | <kbd>3</kbd>              | Show/hide the arrow plot                                                 |
 | <kbd>ctrl 3</kbd>         | Cycle through the color map for the arrow plot                           |
-| <kbd>[</kbd>              | Increase arrow density                                                   |
-| <kbd>]</kbd>              | Decrease arrow density                                                   |
+| <kbd>A</kbd>              | Increase arrow density                                                   |
+| <kbd>shift A</kbd>        | Decrease arrow density                                                   |
 
 ## Mouse/touchpad control
 

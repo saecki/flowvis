@@ -123,6 +123,7 @@ struct State {
 
 struct PlaybackState {
     play: bool,
+    speed: f32,
     current_frame: usize,
     uploaded_frame: usize,
     last_frame_uploaded: Instant,
@@ -137,6 +138,14 @@ impl PlaybackState {
     fn next_frame(&mut self) {
         let frame = &mut self.current_frame;
         *frame = (*frame + 1) % flow::T_CELLS;
+    }
+
+    fn slower(&mut self) {
+        self.speed = (self.speed - 0.125).clamp(0.125, 4.0);
+    }
+
+    fn faster(&mut self) {
+        self.speed = (self.speed + 0.125).clamp(0.125, 4.0);
     }
 }
 
@@ -195,6 +204,16 @@ struct ArrowState {
     invalidated: bool,
     current_color_map: usize,
     uploaded_color_map: usize,
+}
+
+impl ArrowState {
+    fn larger_step_size(&mut self) {
+        self.step_size = (self.step_size * 2.0).clamp(0.25, 32.0);
+    }
+
+    fn smaller_step_size(&mut self) {
+        self.step_size = (self.step_size * 0.5).clamp(0.25, 32.0);
+    }
 }
 
 #[derive(Default)]
@@ -401,6 +420,7 @@ impl State {
 
         let playback = PlaybackState {
             play: true,
+            speed: 1.0,
             current_frame: 0,
             uploaded_frame: 0,
             last_frame_uploaded: Instant::now(),
@@ -593,6 +613,14 @@ impl State {
                     self.playback.next_frame();
                     true
                 }
+                KeyCode::BracketLeft if key_state.is_pressed() => {
+                    self.playback.slower();
+                    true
+                }
+                KeyCode::BracketRight if key_state.is_pressed() => {
+                    self.playback.faster();
+                    true
+                }
 
                 // visibility and color-maps
                 KeyCode::Digit1 if key_state.is_pressed() && self.keyboard.ctrl_down() => {
@@ -672,13 +700,13 @@ impl State {
                 }
 
                 // arrow
-                KeyCode::BracketLeft if key_state.is_pressed() => {
-                    self.arrow.step_size = (self.arrow.step_size * 2.0).clamp(0.25, 32.0);
+                KeyCode::KeyA if key_state.is_pressed() && self.keyboard.shift_down() => {
+                    self.arrow.larger_step_size();
                     self.arrow.invalidated = true;
                     true
                 }
-                KeyCode::BracketRight if key_state.is_pressed() => {
-                    self.arrow.step_size = (self.arrow.step_size * 0.5).clamp(0.25, 32.0);
+                KeyCode::KeyA if key_state.is_pressed() => {
+                    self.arrow.smaller_step_size();
                     self.arrow.invalidated = true;
                     true
                 }
@@ -786,7 +814,7 @@ impl State {
                         for (vi, v) in self.line_pipeline.vertices.iter().enumerate() {
                             let p: Vector2<f32> = unsafe { std::mem::transmute(v.position) };
                             let mag = (pos - p).magnitude();
-                            if mag < 0.001 {
+                            if mag < 0.002 {
                                 match closest {
                                     Some((other_mag, _)) => {
                                         if mag < other_mag {
@@ -839,7 +867,7 @@ impl State {
         );
 
         let now = Instant::now();
-        let desired_delta = Duration::from_secs_f32(flow::T_STEP);
+        let desired_delta = Duration::from_secs_f32(flow::T_STEP / playback.speed);
         let actual_delta = now.duration_since(playback.last_frame_uploaded);
         if playback.play && actual_delta >= desired_delta {
             playback.next_frame();
@@ -1868,9 +1896,10 @@ fn update_text(
         }
     }
 
-    let zoom = transform.zoom;
     let frame = playback.current_frame;
-    let mut text = format!("frame = {frame:4}  zoom = {zoom:.2}x");
+    let speed = playback.speed;
+    let zoom = transform.zoom;
+    let mut text = format!("frame = {frame:4}  speed = {speed:.3}x  zoom = {zoom:.2}x");
 
     let bg_on = on_off_str(bg.visible);
     let filter = bg.filter;
