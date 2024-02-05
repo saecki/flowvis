@@ -91,6 +91,17 @@ impl std::ops::Mul<f32> for Vec2 {
     }
 }
 
+impl std::ops::Div<f32> for Vec2 {
+    type Output = Vec2;
+
+    fn div(self, rhs: f32) -> Self::Output {
+        Self {
+            x: self.x / rhs,
+            y: self.y / rhs,
+        }
+    }
+}
+
 impl std::ops::Add<Vec2> for Vec2 {
     type Output = Vec2;
 

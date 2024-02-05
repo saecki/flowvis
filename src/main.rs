@@ -2004,7 +2004,7 @@ fn compute_stream_line(
                     break;
                 }
 
-                pos += (k1 + k2 + k3 + k4) * 0.25;
+                pos += (k1 + k2 * 2.0 + k3 * 2.0 + k4) / 6.0;
             }
         }
         if !flow::in_bounds(pos) {
