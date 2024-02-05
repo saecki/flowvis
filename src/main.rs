@@ -1902,10 +1902,10 @@ fn update_text(
     let mut text = format!("frame = {frame:4}  speed = {speed:.3}x  zoom = {zoom:.2}x");
 
     let bg_on = on_off_str(bg.visible);
-    let filter = bg.filter;
+    let filter = on_off_str(bg.filter);
     write!(&mut text, " | bg = {bg_on:3}").ok();
     #[rustfmt::skip]
-    write_or_pad(&mut text, bg.visible, format_args!("  filter bg = {filter:5}"));
+    write_or_pad(&mut text, bg.visible, format_args!("  filter bg = {filter:3}"));
 
     let line_on = on_off_str(line.visible);
     let method = match line.method {
@@ -1913,12 +1913,12 @@ fn update_text(
         LineMethod::Rk2 => "RK2",
         LineMethod::Rk4 => "RK4",
     };
-    let interactive = line.interactive;
+    let interactive = on_off_str(line.interactive);
     write!(&mut text, " | stream lines = {line_on:3}").ok();
     #[rustfmt::skip]
     write_or_pad(&mut text, line.visible, format_args!("  line method = {method:5}"));
     #[rustfmt::skip]
-    write_or_pad(&mut text, line.visible, format_args!("  interactive line = {interactive:5}"));
+    write_or_pad(&mut text, line.visible, format_args!("  interactive line = {interactive:3}"));
 
     let arrow_on = on_off_str(arrow.visible);
     let arrow_step_size = arrow.step_size;
