@@ -245,9 +245,15 @@ impl Transform {
         *self = Self::default();
     }
 
-    pub fn pan_by(&mut self, delta: Vector2<f32>) {
+    /// Pan by the normalized delta with pre-multiplied zoom.
+    pub fn pan_by_premultiplied(&mut self, delta: Vector2<f32>) {
         let Vector2 { x, y } = self.offset + delta;
         self.offset = Vector2::new(x.clamp(-2.0, 2.0), y.clamp(-2.0, 2.0));
+    }
+
+    /// Pan by the normalized delta.
+    pub fn pan_by(&mut self, delta: Vector2<f32>) {
+        self.pan_by_premultiplied(2.0 * delta / self.zoom);
     }
 
     pub fn zoom_discrete(&mut self, steps: i8) {
@@ -259,6 +265,11 @@ impl Transform {
         for _ in 0..steps.abs() {
             new *= factor;
         }
+        self.zoom = new.clamp(0.125, 100.0);
+    }
+
+    pub fn zoom_smooth(&mut self, factor: f32) {
+        let new = self.zoom * factor;
         self.zoom = new.clamp(0.125, 100.0);
     }
 }
@@ -690,7 +701,7 @@ impl State {
                 match self.mouse.pos {
                     Some(old_pos) if self.mouse.middle_down => {
                         let delta = new_pos - old_pos;
-                        self.transform.pan_by(delta);
+                        self.transform.pan_by_premultiplied(delta);
                     }
                     _ => {
                         self.mouse.pos = Some(new_pos);
@@ -707,18 +718,53 @@ impl State {
                 self.mouse.pos = None;
                 true
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_x, y) => {
-                        self.transform.zoom_discrete(*y as i8);
-                        true
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(_) => {
-                        // TODO
-                        true
-                    }
+            // Zoom
+            WindowEvent::MouseWheel { delta, .. } if self.keyboard.ctrl_down() => match delta {
+                winit::event::MouseScrollDelta::LineDelta(_x, y) => {
+                    self.transform.zoom_discrete(*y as i8);
+                    true
                 }
-            }
+                winit::event::MouseScrollDelta::PixelDelta(delta) => {
+                    let normalized = delta.y as f32 / self.config.height as f32;
+                    let abs = normalized.abs();
+                    let factor = if normalized < 0.0 {
+                        1.0 / (1.0 + 2.0 * abs)
+                    } else {
+                        1.0 + 2.0 * abs
+                    };
+                    self.transform.zoom_smooth(factor);
+                    true
+                }
+            },
+            // pan
+            WindowEvent::MouseWheel { delta, .. } => match delta {
+                winit::event::MouseScrollDelta::LineDelta(_, y) if self.keyboard.shift_down() => {
+                    self.transform.pan_by(Vector2::new(0.02 * y, 0.0));
+                    true
+                }
+                winit::event::MouseScrollDelta::LineDelta(x, y) => {
+                    self.transform.pan_by(Vector2::new(0.02 * x, 0.02 * y));
+                    true
+                }
+                winit::event::MouseScrollDelta::PixelDelta(delta) if self.keyboard.shift_down() => {
+                    let normalized = Vector2::new(
+                        // flip y delta
+                        -delta.y as f32 / self.config.height as f32,
+                        0.0,
+                    );
+                    self.transform.pan_by(normalized);
+                    true
+                }
+                winit::event::MouseScrollDelta::PixelDelta(delta) => {
+                    let normalized = Vector2::new(
+                        delta.x as f32 / self.config.width as f32,
+                        // flip y delta
+                        -delta.y as f32 / self.config.height as f32,
+                    );
+                    self.transform.pan_by(normalized);
+                    true
+                }
+            },
             // TODO: handle touchpad events
             // WindowEvent::TouchpadMagnify { device_id, delta, phase } => (),
             // WindowEvent::TouchpadRotate { device_id, delta, phase } => (),

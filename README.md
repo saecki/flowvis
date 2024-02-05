@@ -35,12 +35,14 @@ Visualize a 2D vector field from the `flow.raw` file, which needs to be placed i
 | <kbd>[</kbd>              | Increase arrow density                                                   |
 | <kbd>]</kbd>              | Decrease arrow density                                                   |
 
-## Mouse control
+## Mouse/touchpad control
 
 | Key                              | Action                   |
 |----------------------------------|--------------------------|
 | <kbd>ctrl left-click</kbd>       | Add a stream line origin |
 | <kbd>ctrl right-click</kbd>      | Remove a stream line     |
-| <kbd>ctrl mouse-wheel</kbd>      | Zoom                     |
+| <kbd>ctrl scroll</kbd>           | Zoom                     |
+| <kbd>scroll</kbd>                | Pan                      |
+| <kbd>shift scroll</kbd>          | Pan in x-direction       |
 | <kbd>middle-click</kbd> and drag | Pan                      |
 
