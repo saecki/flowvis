@@ -20,6 +20,20 @@ const LINE_COLOR_MAPS: [&ColorMap; 3] = [&color_map::INFERNO, &color_map::VIRIDI
 const ARROW_COLOR_MAPS: [&ColorMap; 3] =
     [&color_map::INFERNO, &color_map::VIRIDIS, &color_map::RED];
 
+const SPEED_STEP_SIZE: f32 = 0.125;
+const MIN_SPEED: f32 = 0.125;
+const MAX_SPEED: f32 = 4.0;
+const PAN_STEP_SIZE: f32 = 0.02;
+const MAX_PAN_DIST: f32 = 2.0;
+const ZOOM_FACTOR: f32 = 1.1;
+const MIN_ZOOM: f32 = 0.125;
+const MAX_ZOOM: f32 = 100.0;
+
+const NUM_SPAWN_LINES: usize = 2 * flow::Y_CELLS;
+
+const MIN_ARROW_STEP: f32 = 0.25;
+const MAX_ARROW_STEP: f32 = 32.0;
+
 const VELOCITY_TEXTURE_SIZE: wgpu::Extent3d = wgpu::Extent3d {
     width: flow::X_CELLS as u32,
     height: flow::Y_CELLS as u32,
@@ -140,12 +154,16 @@ impl PlaybackState {
         *frame = (*frame + 1) % flow::T_CELLS;
     }
 
+    fn set_speed(&mut self, speed: f32) {
+        self.speed = speed.clamp(MIN_SPEED, MAX_SPEED)
+    }
+
     fn slower(&mut self) {
-        self.speed = (self.speed - 0.125).clamp(0.125, 4.0);
+        self.set_speed(self.speed - SPEED_STEP_SIZE);
     }
 
     fn faster(&mut self) {
-        self.speed = (self.speed + 0.125).clamp(0.125, 4.0);
+        self.set_speed(self.speed + SPEED_STEP_SIZE);
     }
 }
 
@@ -207,12 +225,16 @@ struct ArrowState {
 }
 
 impl ArrowState {
+    fn set_step_size(&mut self, step_size: f32) {
+        self.step_size = (step_size).clamp(MIN_ARROW_STEP, MAX_ARROW_STEP);
+    }
+
     fn larger_step_size(&mut self) {
-        self.step_size = (self.step_size * 2.0).clamp(0.25, 32.0);
+        self.set_step_size(self.step_size * 2.0);
     }
 
     fn smaller_step_size(&mut self) {
-        self.step_size = (self.step_size * 0.5).clamp(0.25, 32.0);
+        self.set_step_size(self.step_size * 0.5);
     }
 }
 
@@ -267,7 +289,10 @@ impl Transform {
     /// Pan by the normalized delta with pre-multiplied zoom.
     pub fn pan_by_premultiplied(&mut self, delta: Vector2<f32>) {
         let Vector2 { x, y } = self.offset + delta;
-        self.offset = Vector2::new(x.clamp(-2.0, 2.0), y.clamp(-2.0, 2.0));
+        self.offset = Vector2::new(
+            x.clamp(-flow::X_SCALE * MAX_PAN_DIST, flow::X_SCALE * MAX_PAN_DIST),
+            y.clamp(-flow::Y_SCALE * MAX_PAN_DIST, flow::Y_SCALE * MAX_PAN_DIST),
+        );
     }
 
     /// Pan by the normalized delta.
@@ -275,21 +300,18 @@ impl Transform {
         self.pan_by_premultiplied(2.0 * delta / self.zoom);
     }
 
+    fn zoom_internal(&mut self, new: f32) {
+        self.zoom = new.clamp(MIN_ZOOM, MAX_ZOOM);
+    }
+
     pub fn zoom_discrete(&mut self, steps: i8) {
-        let mut new = self.zoom;
-        let mut factor = 1.1;
-        if steps < 0 {
-            factor = 1.0 / factor
-        }
-        for _ in 0..steps.abs() {
-            new *= factor;
-        }
-        self.zoom = new.clamp(0.125, 100.0);
+        let new = self.zoom * ZOOM_FACTOR.powi(steps as i32);
+        self.zoom_internal(new);
     }
 
     pub fn zoom_smooth(&mut self, factor: f32) {
         let new = self.zoom * factor;
-        self.zoom = new.clamp(0.125, 100.0);
+        self.zoom_internal(new);
     }
 }
 
@@ -767,11 +789,12 @@ impl State {
             // pan
             WindowEvent::MouseWheel { delta, .. } => match delta {
                 winit::event::MouseScrollDelta::LineDelta(_, y) if self.keyboard.shift_down() => {
-                    self.transform.pan_by(Vector2::new(0.02 * y, 0.0));
+                    self.transform.pan_by(Vector2::new(PAN_STEP_SIZE * y, 0.0));
                     true
                 }
                 winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                    self.transform.pan_by(Vector2::new(0.02 * x, 0.02 * y));
+                    self.transform
+                        .pan_by(Vector2::new(PAN_STEP_SIZE * x, PAN_STEP_SIZE * y));
                     true
                 }
                 winit::event::MouseScrollDelta::PixelDelta(delta) if self.keyboard.shift_down() => {
@@ -1421,10 +1444,10 @@ fn create_bg_pipeline(
 
     #[rustfmt::skip]
     const BG_VERTICES: &[TextureVertex] = &[
-        TextureVertex { position: [-1.0, -0.125], tex_coords: [0.0, 1.0] },
-        TextureVertex { position: [ 1.0, -0.125], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [ 1.0,  0.125], tex_coords: [1.0, 0.0] },
-        TextureVertex { position: [-1.0,  0.125], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [-flow::X_SCALE, -flow::Y_SCALE], tex_coords: [0.0, 1.0] },
+        TextureVertex { position: [ flow::X_SCALE, -flow::Y_SCALE], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [ flow::X_SCALE,  flow::Y_SCALE], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [-flow::X_SCALE,  flow::Y_SCALE], tex_coords: [0.0, 0.0] },
     ];
     #[rustfmt::skip]
     const BG_INDICES: &[u16] = &[
@@ -1963,23 +1986,21 @@ fn update_buffer<T: bytemuck::NoUninit>(
 
 fn spawn_lines1(line: &mut LineState) {
     line.origins.clear();
-    let num = 2 * flow::Y_CELLS;
-    line.origins.extend((0..num).map(|i| flow::Pos2 {
-        x: 0.0,
-        y: (flow::Y_CELLS - 1) as f32 * i as f32 / (num - 1) as f32,
-    }));
+    line.origins
+        .extend((0..NUM_SPAWN_LINES).map(|i| flow::Pos2 {
+            x: 0.0,
+            y: (flow::Y_CELLS - 1) as f32 * i as f32 / (NUM_SPAWN_LINES - 1) as f32,
+        }));
 }
 
 fn spawn_lines2(line: &mut LineState) {
     line.origins.clear();
-    let num = 2 * flow::Y_CELLS;
-    let new_origins = (0..num).map(|i| {
-        let i = 2.0 * (i as f32 / (num - 1) as f32) - 1.0;
+    line.origins.extend((0..NUM_SPAWN_LINES).map(|i| {
+        let i = 2.0 * (i as f32 / (NUM_SPAWN_LINES - 1) as f32) - 1.0;
         let y = i.signum() * i.abs().powf(1.5);
-        let pos = Vector2::new(-1.0, 0.125 * y);
+        let pos = Vector2::new(-flow::X_SCALE, flow::Y_SCALE * y);
         normalized_to_flow_pos(pos).unwrap()
-    });
-    line.origins.extend(new_origins);
+    }));
 }
 
 fn compute_lines(
@@ -2035,7 +2056,7 @@ fn compute_stream_line(
     let mut v0 = bilinear_lookup(frame, pos);
 
     const MIN_VELOCITY: f32 = 0.01;
-    const MAX_NUM_STEPS: usize = 2_000;
+    const MAX_NUM_STEPS: usize = 10_000;
     const STEP_SIZE: f32 = 0.5;
 
     vertices.push(ScalarVertex {
@@ -2168,15 +2189,18 @@ fn lerp(u: f32, a: flow::Vec2, b: flow::Vec2) -> flow::Vec2 {
 }
 
 fn normalized_to_flow_pos(pos: Vector2<f32>) -> Option<flow::Pos2> {
-    (-0.125..=0.125).contains(&pos.y).then(|| flow::Pos2 {
-        x: 0.5 * (pos.x + 1.0) * (flow::X_CELLS - 1) as f32,
-        y: 4.0 * (pos.y + 0.125) * (flow::Y_CELLS - 1) as f32,
+    let in_x = (-flow::X_SCALE..=flow::X_SCALE).contains(&pos.x);
+    let in_y = (-flow::Y_SCALE..=flow::Y_SCALE).contains(&pos.y);
+
+    (in_x && in_y).then(|| flow::Pos2 {
+        x: 0.5 / flow::X_SCALE * (pos.x + flow::X_SCALE) * (flow::X_CELLS - 1) as f32,
+        y: 0.5 / flow::Y_SCALE * (pos.y + flow::Y_SCALE) * (flow::Y_CELLS - 1) as f32,
     })
 }
 
 fn flow_pos_to_wgpu_coord(pos: flow::Pos2) -> [f32; 2] {
     [
-        2.0 * (pos.x / (flow::X_CELLS - 1) as f32) - 1.0,
-        0.25 * (pos.y / (flow::Y_CELLS - 1) as f32) - 0.125,
+        2.0 * flow::X_SCALE * (pos.x / (flow::X_CELLS - 1) as f32 - 0.5),
+        2.0 * flow::Y_SCALE * (pos.y / (flow::Y_CELLS - 1) as f32 - 0.5),
     ]
 }

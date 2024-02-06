@@ -9,16 +9,22 @@ mod consts {
     pub const X_START: f32 = -0.5;
     pub const X_END: f32 = 7.5;
     pub const X_STEP: f32 = (X_END - X_START) / X_CELLS as f32;
+
     pub const Y_CELLS: usize = 50;
     pub const Y_START: f32 = -0.5;
     pub const Y_END: f32 = 0.5;
     pub const Y_STEP: f32 = (Y_END - Y_START) / Y_CELLS as f32;
+
     pub const T_CELLS: usize = 1001;
     pub const T_START: f32 = 15.0;
     pub const T_END: f32 = 23.0;
     pub const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
+
     pub const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
     pub const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
+
+    pub const X_SCALE: f32 = 1.0;
+    pub const Y_SCALE: f32 = Y_CELLS as f32 / X_CELLS as f32;
 }
 
 pub struct Field {
