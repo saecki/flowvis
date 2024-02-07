@@ -834,7 +834,13 @@ impl State {
                 MouseButton::Right if button_state.is_pressed() => {
                     if let Some(pos) = self.mouse.pos {
                         let mut closest = None;
-                        for (vi, v) in self.line_pipeline.vertices.iter().enumerate() {
+
+                        let last_origin_index = self.line_pipeline.first_vertices.last();
+                        let vertcies = match (self.line.interactive, last_origin_index) {
+                            (true, Some(&oi)) => &self.line_pipeline.vertices[..oi],
+                            _ => &self.line_pipeline.vertices,
+                        };
+                        for (vi, v) in vertcies.iter().enumerate() {
                             let p: Vector2<f32> = unsafe { std::mem::transmute(v.position) };
                             let mag = (pos - p).magnitude();
                             if mag < 0.002 {
