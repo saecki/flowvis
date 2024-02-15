@@ -21,7 +21,7 @@ mod consts {
     pub const T_STEP: f32 = (T_END - T_START) / T_CELLS as f32;
 
     pub const FRAME_SIZE: usize = X_CELLS * Y_CELLS;
-    pub const TOTAL_ELEMS: usize = FRAME_SIZE * T_CELLS;
+    pub const TOTAL_SIZE: usize = FRAME_SIZE * T_CELLS;
 
     pub const X_SCALE: f32 = 1.0;
     pub const Y_SCALE: f32 = Y_CELLS as f32 / X_CELLS as f32;
@@ -29,41 +29,43 @@ mod consts {
 
 pub struct Field {
     pub max_velocity: f32,
-    data: Vec<Vec2>,
+    data: Box<[Vec2; TOTAL_SIZE]>,
 }
 
 impl Field {
     #[cfg(target_endian = "little")]
     pub fn read(path: &Path) -> anyhow::Result<Field> {
         let mut file = std::fs::File::open(path)?;
-        let mut data = vec![Vec2::ZERO; TOTAL_ELEMS];
+        let mut data = vec![Vec2::ZERO; TOTAL_SIZE];
         let raw = bytemuck::cast_slice_mut(data.as_mut_slice());
         file.read_exact(raw)?;
 
+        let data: Box<[Vec2; TOTAL_SIZE]> = data.into_boxed_slice().try_into().unwrap();
         let max_velocity = data
             .iter()
             .copied()
             .map(|v| v.norm())
             .max_by(f32::total_cmp)
             .unwrap();
+
         Ok(Field { max_velocity, data })
     }
 
     pub fn frame(&self, t: usize) -> Frame<'_> {
-        Frame(&self.data[t * FRAME_SIZE..(t + 1) * FRAME_SIZE])
+        let slice = &self.data[t * FRAME_SIZE..(t + 1) * FRAME_SIZE];
+        let data = slice.try_into().unwrap();
+        Frame(data)
     }
 }
 
 #[derive(Clone, Copy)]
-pub struct Frame<'a>(&'a [Vec2]);
+pub struct Frame<'a>(&'a [Vec2; FRAME_SIZE]);
 
 impl<'a> Frame<'a> {
     pub fn get(&self, x: u32, y: u32) -> Vec2 {
         debug_assert!(x < X_CELLS as u32);
         debug_assert!(y < Y_CELLS as u32);
-        unsafe {
-            *self.0.get_unchecked((y * X_CELLS as u32 + x) as usize)
-        }
+        unsafe { *self.0.get_unchecked((y * X_CELLS as u32 + x) as usize) }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Vec2> {
