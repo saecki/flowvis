@@ -1450,10 +1450,10 @@ fn create_bg_pipeline(
 
     #[rustfmt::skip]
     const BG_VERTICES: &[TextureVertex] = &[
-        TextureVertex { position: [-flow::X_SCALE, -flow::Y_SCALE], tex_coords: [0.0, 1.0] },
-        TextureVertex { position: [ flow::X_SCALE, -flow::Y_SCALE], tex_coords: [1.0, 1.0] },
-        TextureVertex { position: [ flow::X_SCALE,  flow::Y_SCALE], tex_coords: [1.0, 0.0] },
-        TextureVertex { position: [-flow::X_SCALE,  flow::Y_SCALE], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [-flow::X_SCALE, -flow::Y_SCALE], tex_coords: [0.0, 0.0] },
+        TextureVertex { position: [ flow::X_SCALE, -flow::Y_SCALE], tex_coords: [1.0, 0.0] },
+        TextureVertex { position: [ flow::X_SCALE,  flow::Y_SCALE], tex_coords: [1.0, 1.0] },
+        TextureVertex { position: [-flow::X_SCALE,  flow::Y_SCALE], tex_coords: [0.0, 1.0] },
     ];
     #[rustfmt::skip]
     const BG_INDICES: &[u16] = &[
