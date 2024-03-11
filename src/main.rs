@@ -126,6 +126,7 @@ struct State {
     transform: Transform,
     transform_buffer: wgpu::Buffer,
     max_velocity_buffer: wgpu::Buffer,
+    velocity_texture: wgpu::Texture,
 
     playback: PlaybackState,
     bg: BgState,
@@ -448,6 +449,22 @@ impl State {
             last_frame_uploaded: Instant::now(),
         };
 
+        let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("velocity_texture"),
+            size: VELOCITY_TEXTURE_SIZE,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        write_frame_to_texture(
+            &queue,
+            &velocity_texture,
+            flow_field.frame(playback.current_frame),
+        );
+
         let bg = BgState {
             visible: true,
             filter: true,
@@ -460,9 +477,8 @@ impl State {
             &config,
             &transform_buffer,
             &max_velocity_buffer,
-            &flow_field,
+            &velocity_texture,
             &bg,
-            playback.current_frame,
         );
 
         let mut line = LineState {
@@ -499,9 +515,8 @@ impl State {
             &config,
             &transform_buffer,
             &max_velocity_buffer,
-            &flow_field,
+            &velocity_texture,
             &arrow,
-            playback.current_frame,
         );
 
         let mut text_pipeline = {
@@ -557,6 +572,7 @@ impl State {
             transform,
             transform_buffer,
             max_velocity_buffer,
+            velocity_texture,
 
             playback,
             bg,
@@ -682,9 +698,8 @@ impl State {
                         &self.config,
                         &self.transform_buffer,
                         &self.max_velocity_buffer,
-                        &self.flow_field,
+                        &self.velocity_texture,
                         &self.bg,
-                        self.playback.current_frame,
                     );
                     true
                 }
@@ -902,17 +917,16 @@ impl State {
             playback.next_frame();
         }
         if playback.current_frame != playback.uploaded_frame {
-            if bg.visible {
+            if bg.visible || arrow.visible {
                 write_frame_to_texture(
                     &self.queue,
-                    &self.bg_pipeline.velocity_texture,
+                    &self.velocity_texture,
                     self.flow_field.frame(playback.current_frame),
                 );
             }
             playback.last_frame_uploaded = now;
             playback.uploaded_frame = playback.current_frame;
             line.invalidated = true;
-            arrow.invalidated = true;
             log::debug!("frame_delta = {actual_delta:?}");
         }
         if bg.current_color_map != bg.uploaded_color_map {
@@ -985,13 +999,7 @@ impl State {
                 0,
                 bytemuck::cast_slice(&[arrow.step_size]),
             );
-            update_arrows(
-                &mut pl.vertices,
-                &mut pl.indices,
-                &self.flow_field,
-                playback.current_frame,
-                arrow.step_size,
-            );
+            update_arrows(&mut pl.vertices, &mut pl.indices, arrow.step_size);
             arrow.invalidated = false;
 
             log::debug!("arrow vertices = {}", pl.vertices.len());
@@ -1127,7 +1135,6 @@ struct BgPipeline {
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     num_indices: u32,
-    velocity_texture: wgpu::Texture,
     color_map_texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
 }
@@ -1194,7 +1201,7 @@ impl ScalarVertex {
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct ArrowVertex {
     position: [f32; 2],
-    velocity: [f32; 2],
+    tex_coords: [f32; 2],
 }
 
 impl ArrowVertex {
@@ -1252,21 +1259,9 @@ fn create_bg_pipeline(
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
     max_velocity_buffer: &wgpu::Buffer,
-    flow_field: &flow::Field,
+    velocity_texture: &wgpu::Texture,
     bg: &BgState,
-    current_frame: usize,
 ) -> BgPipeline {
-    let velocity_texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("velocity_texture"),
-        size: VELOCITY_TEXTURE_SIZE,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    write_frame_to_texture(queue, &velocity_texture, flow_field.frame(current_frame));
     let velocity_texture_view =
         velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
     let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1477,15 +1472,14 @@ fn create_bg_pipeline(
         vertex_buffer,
         index_buffer,
         num_indices,
-        velocity_texture,
         color_map_texture,
         bind_group,
     }
 }
 
 fn write_frame_to_texture(queue: &wgpu::Queue, texture: &wgpu::Texture, frame: flow::Frame) {
-    type PixelType = f32;
-    let velocities = frame.iter().map(|v| v.norm()).collect::<Vec<PixelType>>();
+    type PixelType = [f32; 2];
+    let velocities = frame.as_slice();
 
     let pixel_size = std::mem::size_of::<PixelType>() as u32;
     let bytes_per_row = pixel_size * VELOCITY_TEXTURE_SIZE.width;
@@ -1706,19 +1700,24 @@ fn create_arrow_pipeline(
     config: &wgpu::SurfaceConfiguration,
     transform_buffer: &wgpu::Buffer,
     max_velocity_buffer: &wgpu::Buffer,
-    flow_field: &flow::Field,
+    velocity_texture: &wgpu::Texture,
     arrow: &ArrowState,
-    current_frame: usize,
 ) -> ArrowPipeline {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    update_arrows(
-        &mut vertices,
-        &mut indices,
-        flow_field,
-        current_frame,
-        arrow.step_size,
-    );
+    update_arrows(&mut vertices, &mut indices, arrow.step_size);
+
+    let velocity_texture_view =
+        velocity_texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let velocity_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
 
     let color_map_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("arrow_color_map_texture"),
@@ -1756,6 +1755,22 @@ fn create_arrow_pipeline(
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -1765,7 +1780,7 @@ fn create_arrow_pipeline(
                 count: None,
             },
             wgpu::BindGroupLayoutEntry {
-                binding: 1,
+                binding: 3,
                 visibility: wgpu::ShaderStages::FRAGMENT,
                 // should match filterable field of the texture
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -1810,10 +1825,18 @@ fn create_arrow_pipeline(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
+                resource: wgpu::BindingResource::TextureView(&velocity_texture_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
+                resource: wgpu::BindingResource::Sampler(&velocity_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&color_map_texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
                 resource: wgpu::BindingResource::Sampler(&color_map_sampler),
             },
             wgpu::BindGroupEntry {
@@ -2138,17 +2161,10 @@ fn compute_stream_line(
     }
 }
 
-fn update_arrows(
-    vertices: &mut Vec<ArrowVertex>,
-    indices: &mut Vec<[u32; 3]>,
-    flow_field: &flow::Field,
-    current_frame: usize,
-    arrow_step: f32,
-) {
+fn update_arrows(vertices: &mut Vec<ArrowVertex>, indices: &mut Vec<[u32; 3]>, arrow_step: f32) {
     vertices.clear();
     indices.clear();
 
-    let frame = flow_field.frame(current_frame);
     let num_x_arrows = (flow::X_CELLS as f32 - 1.0) / arrow_step;
     let num_y_arrows = (flow::Y_CELLS as f32 - 1.0) / arrow_step;
 
@@ -2158,10 +2174,13 @@ fn update_arrows(
                 x: arrow_step as f32 * x as f32 + 0.5 * (1.0 + num_x_arrows.fract()) * arrow_step,
                 y: arrow_step as f32 * y as f32 + 0.5 * (1.0 + num_y_arrows.fract()) * arrow_step,
             };
-            let velocity = bilinear_lookup(frame, flow_pos);
+            let tex_coords = [
+                flow_pos.x / (flow::X_CELLS - 1) as f32,
+                flow_pos.y / (flow::Y_CELLS - 1) as f32,
+            ];
             let vertex = ArrowVertex {
                 position: flow_pos_to_wgpu_coord(flow_pos),
-                velocity: [velocity.x, velocity.y],
+                tex_coords,
             };
 
             let i = vertices.len() as u32;

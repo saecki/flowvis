@@ -1,13 +1,18 @@
 struct VertexInput {
     @builtin(vertex_index) sub_idx: u32,
     @location(0) position: vec2<f32>,
-    @location(1) velocity: vec2<f32>,
+    @location(1) tex_coords: vec2<f32>,
 }
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) scalar: f32,
 }
+
+@group(0) @binding(0)
+var velocity_texture: texture_2d<f32>;
+@group(0) @binding(1)
+var velocity_sampler: sampler;
 
 @group(0) @binding(8)
 var<uniform> transform: mat3x3<f32>;
@@ -18,14 +23,39 @@ var<uniform> step_size: f32;
 
 const base_scale = 0.001;
 
+fn bilinear_lookup(uv: vec2<f32>, values: vec4<f32>) -> f32 {
+    let u: f32 = uv.x;
+    let v: f32 = uv.y;
+
+    let c01: f32 = values.x;
+    let c11: f32 = values.y;
+    let c10: f32 = values.z;
+    let c00: f32 = values.w;
+
+    // this seems to be the wrong way around, but it works :D
+    let c0: f32 = (1.0 - u) * c10 + u * c00;
+    let c1: f32 = (1.0 - u) * c11 + u * c01;
+
+    return (1.0 - v) * c0 + v * c1;
+}
+
 @vertex
 fn vs_main(
     in: VertexInput,
 ) -> VertexOutput {
     var out: VertexOutput;
-    out.scalar = length(in.velocity) / max_velocity;
 
-    let dir = normalize(in.velocity);
+    // manual bilinear interpolation, since textureSample is only supported in fragment shaders
+    let size: vec2<u32> = textureDimensions(velocity_texture);
+    let max_coords = vec2<f32>(f32(size.x - 1), f32(size.y - 1));
+    let uv = fract(in.tex_coords * max_coords);
+    let velocity = vec2<f32>(
+        bilinear_lookup(uv, textureGather(0, velocity_texture, velocity_sampler, in.tex_coords)),
+        bilinear_lookup(uv, textureGather(1, velocity_texture, velocity_sampler, in.tex_coords)),
+    );
+    let dir = normalize(velocity);
+    out.scalar = length(velocity) / max_velocity;
+
     let rot_mat = mat2x2(
         dir.x, dir.y,
         -dir.y, dir.x,
@@ -77,9 +107,9 @@ fn vs_main(
     return out;
 }
 
-@group(0) @binding(0)
+@group(0) @binding(2)
 var color_map_texture: texture_1d<f32>;
-@group(0) @binding(1)
+@group(0) @binding(3)
 var color_map_sampler: sampler;
 
 @fragment

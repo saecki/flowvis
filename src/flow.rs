@@ -68,8 +68,8 @@ impl<'a> Frame<'a> {
         unsafe { *self.0.get_unchecked((y * X_CELLS as u32 + x) as usize) }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Vec2> {
-        self.0.iter()
+    pub fn as_slice(&self) -> &'a [Vec2] {
+        self.0
     }
 }
 
