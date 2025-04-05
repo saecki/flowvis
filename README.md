@@ -1,5 +1,5 @@
 # flowvis
-Visualize a 2D vector field from the `flow.raw` file, which needs to be placed in this directory.
+Visualize a 2D vector field from the `flow.raw` file.
 
 ![image](https://github.com/user-attachments/assets/508b1986-7059-4c7a-a848-20d17fc31bbf)
 
